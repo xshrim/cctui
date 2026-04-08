@@ -186,6 +186,8 @@ func (m *Model) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.jumpToApp(ccswitch.AppCodex)
 		case "3":
 			m.jumpToApp(ccswitch.AppGemini)
+		case "4":
+			m.jumpToApp(ccswitch.AppOpencode)
 		case "a":
 			row := m.selectedRow()
 			if row != nil {
@@ -215,6 +217,11 @@ func (m *Model) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, textinput.Blink
 			case rowProvider:
 				if row.provider == nil {
+					return m, nil
+				}
+				if row.app.IsIncremental() {
+					// 增量模式不支持切换，回车进入编辑
+					m.openEditForm(row.app, *row.provider)
 					return m, nil
 				}
 				if m.current[row.app] == row.provider.ID {
@@ -690,6 +697,9 @@ func (m *Model) renderHeaderMeta(maxWidth int) string {
 
 func (m *Model) renderGroupHeading(app ccswitch.AppType) string {
 	label := groupStyle.Render(app.DisplayName())
+	if app.IsIncremental() {
+		label += mutedStyle.Render(" (I)")
+	}
 	summary := mutedStyle.Render(fmt.Sprintf("%d 个供应商", len(m.providers[app])))
 	return label + " " + summary
 }
@@ -700,7 +710,7 @@ func (m *Model) renderProviderRow(index int, row listRow) string {
 	}
 
 	selected := index == m.cursor
-	isCurrent := m.current[row.app] == row.provider.ID
+	isCurrent := !row.app.IsIncremental() && m.current[row.app] == row.provider.ID
 	prefix := "  "
 	if selected {
 		prefix = "▶ "
@@ -802,7 +812,7 @@ func (m *Model) renderHelpLines() []string {
 			help("a", "添加"),
 			help("e", "编辑"),
 			help("d", "删除"),
-			help("1/2/3", "跳应用"),
+			help("1/2/3/4", "跳应用"),
 			help("g/G", "顶/底"),
 			help("q", "退出"),
 		}
@@ -981,6 +991,8 @@ func (m *Model) formHint() string {
 		return "Saved to ~/.codex/auth.json and ~/.codex/config.toml"
 	case ccswitch.AppGemini:
 		return "Saved to ~/.gemini/.env and ~/.gemini/settings.json"
+	case ccswitch.AppOpencode:
+		return "Saved to ~/.config/opencode/opencode.json"
 	default:
 		return "Saved to the app live config"
 	}

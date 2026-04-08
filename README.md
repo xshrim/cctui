@@ -1,6 +1,6 @@
 # CC Switch TUI
 
-`CC Switch TUI` 是一个终端界面工具，用来管理并切换 `Claude`、`Codex`、`Gemini` 的多套供应商配置。
+`CC Switch TUI` 是一个终端界面工具，用来管理并切换 `Claude`、`Codex`、`Gemini`、`Opencode` 的多套供应商配置。
 
 它适合以下场景：
 
@@ -10,7 +10,9 @@
 
 ## 功能特性
 
-- 支持 `Claude`、`Codex`、`Gemini` 三类应用
+- 支持 `Claude`、`Codex`、`Gemini`、`Opencode` 四类应用
+- `Claude`、`Codex`、`Gemini` 为替换模式：同一时刻只有一个供应商生效
+- `Opencode` 为增量模式 `(I)`：所有供应商共存于同一配置文件
 - 使用 SQLite 保存供应商配置，数据默认位于 `~/.cc-switch/`
 - 首次启动时，如果某个应用还没有保存的供应商，会尝试导入当前 live 配置
 - 切换前会先读取当前 live 配置并回写数据库，尽量保留你在外部手动改过的内容
@@ -27,6 +29,7 @@
 - `Codex`：`~/.codex/config.toml`
 - `Gemini`：`~/.gemini/.env`
 - `Gemini`：`~/.gemini/settings.json`
+- `Opencode`：`~/.config/opencode/opencode.json`
 
 程序自己的本地数据默认保存在：
 
@@ -93,12 +96,12 @@ go build -o cctui .
 
 启动后会看到按应用分组的供应商列表：
 
-- `Enter`：将当前选中的供应商设为正在使用
+- `Enter`：替换模式下将当前选中的供应商设为正在使用；增量模式下进入编辑
 - `a`：新增供应商
 - `e`：编辑供应商
 - `d`：删除供应商
 - `↑/↓` 或 `j/k`：移动光标
-- `1/2/3`：快速跳转到 `Claude` / `Codex` / `Gemini`
+- `1/2/3/4`：快速跳转到 `Claude` / `Codex` / `Gemini` / `Opencode`
 - `g/G`：跳到顶部 / 底部
 - `q`：退出
 
@@ -142,7 +145,8 @@ go build -o cctui .
 {
   "claudeConfigDir": "/path/to/.claude",
   "codexConfigDir": "/path/to/.codex",
-  "geminiConfigDir": "/path/to/.gemini"
+  "geminiConfigDir": "/path/to/.gemini",
+  "opencodeConfigDir": "/path/to/.config/opencode"
 }
 ```
 
