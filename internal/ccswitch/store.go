@@ -268,9 +268,19 @@ func (s *Store) AddProvider(app AppType, input ProviderInput) (*Provider, bool, 
 	if err != nil {
 		return nil, false, err
 	}
-	if current == "" {
+
+	// 增量模式：所有 provider 共存于同一配置文件，每次添加都要同步
+	if app.IsIncremental() {
 		if err := s.writeLiveSettings(app, provider); err != nil {
 			return nil, false, err
+		}
+	}
+
+	if current == "" {
+		if !app.IsIncremental() {
+			if err := s.writeLiveSettings(app, provider); err != nil {
+				return nil, false, err
+			}
 		}
 		if err := s.setCurrentProvider(app, provider.ID); err != nil {
 			return nil, false, err
@@ -297,13 +307,20 @@ func (s *Store) UpdateProvider(app AppType, existing Provider, input ProviderInp
 		return nil, err
 	}
 
-	current, err := s.GetEffectiveCurrentProvider(app)
-	if err != nil {
-		return nil, err
-	}
-	if current == existing.ID {
+	// 增量模式：所有 provider 共存于同一配置文件，每次更新都要同步
+	if app.IsIncremental() {
 		if err := s.writeLiveSettings(app, provider); err != nil {
 			return nil, err
+		}
+	} else {
+		current, err := s.GetEffectiveCurrentProvider(app)
+		if err != nil {
+			return nil, err
+		}
+		if current == existing.ID {
+			if err := s.writeLiveSettings(app, provider); err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -328,6 +345,17 @@ func (s *Store) DeleteProvider(app AppType, id string) error {
 
 	if _, err := s.db.Exec(`DELETE FROM providers WHERE id = ? AND app_type = ?`, id, app.String()); err != nil {
 		return fmt.Errorf("删除供应商失败: %w", err)
+	}
+
+	// 增量模式：从配置文件中移除对应的 provider 条目
+	if app.IsIncremental() {
+		for _, p := range providers {
+			if p.ID == id {
+				key := opencodeProviderKey(p.SettingsConfig, id)
+				s.removeOpencodeProviderEntry(key)
+				break
+			}
+		}
 	}
 
 	if current == id {
@@ -452,6 +480,21 @@ func (s *Store) ExtractInput(app AppType, provider Provider) ProviderInput {
 			Website: deref(provider.WebsiteURL),
 			Notes:   deref(provider.Notes),
 		}
+	case AppOpencode:
+		options, modelsMap := opencodeProviderConfig(provider.SettingsConfig, provider.ID)
+		firstModelName := ""
+		for name := range modelsMap {
+			firstModelName = name
+			break
+		}
+		return ProviderInput{
+			Name:    provider.Name,
+			BaseURL: stringValue(options["baseURL"]),
+			APIKey:  stringValue(options["apiKey"]),
+			Model:   firstModelName,
+			Website: deref(provider.WebsiteURL),
+			Notes:   deref(provider.Notes),
+		}
 	default:
 		return ProviderInput{Name: provider.Name}
 	}
@@ -480,6 +523,12 @@ func (s *Store) EndpointSummary(app AppType, provider Provider) string {
 			return "Google OAuth"
 		}
 		return summarizeURL(baseURL)
+	case AppOpencode:
+		options, _ := opencodeProviderConfig(provider.SettingsConfig, provider.ID)
+		if baseURL := strings.TrimSpace(stringValue(options["baseURL"])); baseURL != "" {
+			return summarizeURL(baseURL)
+		}
+		return "-"
 	default:
 		return "-"
 	}
@@ -745,6 +794,44 @@ func (s *Store) buildProvider(app AppType, existing *Provider, input ProviderInp
 		patchStringField(env, "GEMINI_MODEL", input.Model)
 		settings["env"] = env
 		provider.SettingsConfig = settings
+
+	case AppOpencode:
+		settings := CloneMap(provider.SettingsConfig)
+		modelName := strings.TrimSpace(input.Model)
+		if modelName == "" {
+			modelName = "default"
+		}
+
+		modelsValue := map[string]any{
+			modelName: map[string]any{"name": modelName},
+		}
+		optionsValue := map[string]any{"setCacheKey": true}
+		// 保留已有 options
+		existingOpts, _ := opencodeProviderConfig(settings, id)
+		for k, v := range existingOpts {
+			optionsValue[k] = v
+		}
+		patchStringField(optionsValue, "baseURL", input.BaseURL)
+		patchStringField(optionsValue, "apiKey", input.APIKey)
+
+		// 确定 provider key：优先复用现有 key，新建时用 slugify(name)
+		provKey := opencodeProviderKey(settings, id)
+		if provKey == id {
+			if s := slugify(input.Name); s != "" {
+				provKey = s
+			}
+		}
+
+		provConfig := getOrCreateMap(settings, "provider")
+		provConfig[provKey] = map[string]any{
+			"models":  modelsValue,
+			"options": optionsValue,
+		}
+		settings["provider"] = provConfig
+		// 只保留嵌套结构，不存 top-level 冗余字段
+		delete(settings, "models")
+		delete(settings, "options")
+		provider.SettingsConfig = settings
 	}
 
 	return provider, nil
@@ -837,6 +924,21 @@ func (s *Store) readLiveSettings(app AppType) (map[string]any, error) {
 		}
 
 		return result, nil
+
+	case AppOpencode:
+		path := s.opencodeConfigPath()
+		content, err := os.ReadFile(path)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return nil, os.ErrNotExist
+			}
+			return nil, fmt.Errorf("读取 Opencode 配置失败: %w", err)
+		}
+		var settings map[string]any
+		if err := json.Unmarshal(content, &settings); err != nil {
+			return nil, fmt.Errorf("解析 Opencode 配置失败: %w", err)
+		}
+		return settings, nil
 	}
 
 	return nil, fmt.Errorf("不支持的应用类型: %s", app)
@@ -852,6 +954,8 @@ func (s *Store) writeLiveSettings(app AppType, provider Provider) error {
 		return writeCodexLiveAtomic(s.codexAuthPath(), s.codexConfigPath(), auth, config)
 	case AppGemini:
 		return s.writeGeminiLive(provider)
+	case AppOpencode:
+		return s.writeOpencodeLive(provider)
 	default:
 		return fmt.Errorf("不支持的应用类型: %s", app)
 	}
@@ -903,6 +1007,82 @@ func (s *Store) writeGeminiLive(provider Provider) error {
 	return nil
 }
 
+// opencodeProviderKey 从 SettingsConfig 中解析 opencode.json 对应的 provider key。
+// 优先用 providerID 精确匹配，否则取第一个 key，最后 fallback 到 providerID 本身。
+func opencodeProviderKey(settings map[string]any, providerID string) string {
+	provConfigs, ok := settings["provider"].(map[string]any)
+	if !ok || len(provConfigs) == 0 {
+		return providerID
+	}
+	if _, found := provConfigs[providerID]; found {
+		return providerID
+	}
+	for k := range provConfigs {
+		return k
+	}
+	return providerID
+}
+
+// opencodeProviderConfig 从 SettingsConfig 中提取指定 provider 的 options 和 models。
+func opencodeProviderConfig(settings map[string]any, providerID string) (options, models map[string]any) {
+	key := opencodeProviderKey(settings, providerID)
+	if provConfigs, ok := settings["provider"].(map[string]any); ok {
+		if cfg, ok := provConfigs[key].(map[string]any); ok {
+			options, _ = cfg["options"].(map[string]any)
+			models, _ = cfg["models"].(map[string]any)
+		}
+	}
+	if options == nil {
+		options = map[string]any{}
+	}
+	return
+}
+
+func (s *Store) writeOpencodeLive(provider Provider) error {
+	settings := CloneMap(provider.SettingsConfig)
+	path := s.opencodeConfigPath()
+
+	// 读取现有文件，保留其他 provider 和 $schema
+	doc := map[string]any{}
+	if content, err := os.ReadFile(path); err == nil {
+		_ = json.Unmarshal(content, &doc)
+	}
+	if schema, ok := settings["$schema"]; ok {
+		doc["$schema"] = schema
+	}
+
+	// 合并当前 provider 条目到文件
+	docProviders := getOrCreateMap(doc, "provider")
+	key := opencodeProviderKey(settings, provider.ID)
+	if srcProviders, ok := settings["provider"].(map[string]any); ok {
+		if entry, ok := srcProviders[key]; ok {
+			docProviders[key] = entry
+		}
+	}
+	doc["provider"] = docProviders
+
+	return writeJSONAtomic(path, doc)
+}
+
+func (s *Store) removeOpencodeProviderEntry(providerID string) {
+	path := s.opencodeConfigPath()
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(content, &doc); err != nil {
+		return
+	}
+	providers, ok := doc["provider"].(map[string]any)
+	if !ok {
+		return
+	}
+	delete(providers, providerID)
+	doc["provider"] = providers
+	_ = writeJSONAtomic(path, doc)
+}
+
 func (s *Store) claudeSettingsPath() string {
 	dir := s.configDirFor(AppClaude)
 	settingsPath := filepath.Join(dir, "settings.json")
@@ -932,6 +1112,10 @@ func (s *Store) geminiSettingsPath() string {
 	return filepath.Join(s.configDirFor(AppGemini), "settings.json")
 }
 
+func (s *Store) opencodeConfigPath() string {
+	return filepath.Join(s.configDirFor(AppOpencode), "opencode.json")
+}
+
 func (s *Store) configDirFor(app AppType) string {
 	key := configDirKey(app)
 	if custom := strings.TrimSpace(s.settings.getString(key)); custom != "" {
@@ -945,6 +1129,8 @@ func (s *Store) configDirFor(app AppType) string {
 		return filepath.Join(homeDir(), ".codex")
 	case AppGemini:
 		return filepath.Join(homeDir(), ".gemini")
+	case AppOpencode:
+		return filepath.Join(homeDir(), ".config", "opencode")
 	default:
 		return homeDir()
 	}
@@ -1018,6 +1204,8 @@ func configDirKey(app AppType) string {
 		return "codexConfigDir"
 	case AppGemini:
 		return "geminiConfigDir"
+	case AppOpencode:
+		return "opencodeConfigDir"
 	default:
 		return ""
 	}

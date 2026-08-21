@@ -8,12 +8,13 @@ import (
 type AppType string
 
 const (
-	AppClaude AppType = "claude"
-	AppCodex  AppType = "codex"
-	AppGemini AppType = "gemini"
+	AppClaude   AppType = "claude"
+	AppCodex    AppType = "codex"
+	AppGemini   AppType = "gemini"
+	AppOpencode AppType = "opencode"
 )
 
-var AllAppTypes = []AppType{AppClaude, AppCodex, AppGemini}
+var AllAppTypes = []AppType{AppClaude, AppCodex, AppGemini, AppOpencode}
 
 func (a AppType) String() string {
 	return string(a)
@@ -27,9 +28,16 @@ func (a AppType) DisplayName() string {
 		return "Codex"
 	case AppGemini:
 		return "Gemini"
+	case AppOpencode:
+		return "Opencode"
 	default:
 		return strings.Title(string(a))
 	}
+}
+
+// IsIncremental 返回该应用类型的配置是否为增量模式（多 provider 共存于同一配置文件）
+func (a AppType) IsIncremental() bool {
+	return a == AppOpencode
 }
 
 type Provider struct {
