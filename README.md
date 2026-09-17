@@ -18,6 +18,7 @@
 - 切换前会先读取当前 live 配置并回写数据库，尽量保留你在外部手动改过的内容
 - 支持新增、编辑、删除、切换供应商
 - `Codex` 额外支持配置 `Reasoning Effort`
+- 切换 `Codex` 供应商时可选择自动恢复历史会话
 
 ## 管理的配置文件
 
@@ -97,6 +98,7 @@ go build -o cctui .
 启动后会看到按应用分组的供应商列表：
 
 - `Enter`：替换模式下将当前选中的供应商设为正在使用；增量模式下进入编辑
+- 切换 `Codex` 时：`r` / `Space` 开关会话恢复，`Enter` / `y` 确认并按当前选项执行，`n` 仅切换不恢复
 - `a`：新增供应商
 - `e`：编辑供应商
 - `d`：删除供应商
@@ -136,6 +138,10 @@ go build -o cctui .
 ### 切换时同步
 
 切换到新供应商前，程序会先尝试读取当前 live 配置，并回写到当前供应商记录中；随后再把目标供应商写入 live 配置文件。
+
+### Codex 会话恢复
+
+切换 `Codex` 供应商时，TUI 默认打开会话恢复选项。确认后会读取 `~/.codex/state_5.sqlite`（或 `~/.codex/sqlite/state_5.sqlite`），将其他 provider 的未归档会话迁移到当前 provider，并同步修复 rollout JSONL 与 `session_index.jsonl`。修改前会自动创建带时间戳的 `.bak.session-restore-*` 备份；找不到 Codex 会话数据库时不会影响供应商切换，只会在状态栏提示恢复失败。
 
 ## 高级配置
 

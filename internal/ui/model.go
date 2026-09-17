@@ -9,6 +9,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"cctui/internal/ccswitch"
+	"cctui/internal/codex"
 )
 
 type screenMode int
@@ -17,6 +18,7 @@ const (
 	modeList screenMode = iota
 	modeForm
 	modeConfirm
+	modeSwitchConfirm
 )
 
 type rowKind int
@@ -58,20 +60,27 @@ type confirmState struct {
 	provider ccswitch.Provider
 }
 
+type switchConfirmState struct {
+	app            ccswitch.AppType
+	provider       ccswitch.Provider
+	restoreSession bool
+}
+
 type Model struct {
-	store       *ccswitch.Store
-	width       int
-	height      int
-	mode        screenMode
-	rows        []listRow
-	cursor      int
-	current     map[ccswitch.AppType]string
-	providers   map[ccswitch.AppType][]ccswitch.Provider
-	form        formState
-	confirm     *confirmState
-	status      string
-	statusKind  statusLevel
-	selectedKey string
+	store         *ccswitch.Store
+	width         int
+	height        int
+	mode          screenMode
+	rows          []listRow
+	cursor        int
+	current       map[ccswitch.AppType]string
+	providers     map[ccswitch.AppType][]ccswitch.Provider
+	form          formState
+	confirm       *confirmState
+	switchConfirm *switchConfirmState
+	status        string
+	statusKind    statusLevel
+	selectedKey   string
 }
 
 var (
@@ -150,6 +159,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.updateForm(msg)
 	case modeConfirm:
 		return m.updateConfirm(msg)
+	case modeSwitchConfirm:
+		return m.updateSwitchConfirm(msg)
 	default:
 		return m, nil
 	}
@@ -161,6 +172,8 @@ func (m *Model) View() string {
 		return m.viewForm()
 	case modeConfirm:
 		return m.viewConfirm()
+	case modeSwitchConfirm:
+		return m.viewSwitchConfirm()
 	default:
 		return m.viewList()
 	}
@@ -228,16 +241,16 @@ func (m *Model) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.setStatus(fmt.Sprintf("%s 已经是当前供应商", row.provider.Name), statusInfo)
 					return m, nil
 				}
-				if err := m.store.SwitchProvider(row.app, row.provider.ID); err != nil {
-					m.setStatus(err.Error(), statusError)
+				if row.app == ccswitch.AppCodex {
+					m.switchConfirm = &switchConfirmState{
+						app:            row.app,
+						provider:       *row.provider,
+						restoreSession: true,
+					}
+					m.mode = modeSwitchConfirm
 					return m, nil
 				}
-				m.selectedKey = row.key
-				if err := m.reload(); err != nil {
-					m.setStatus(err.Error(), statusError)
-					return m, nil
-				}
-				m.setStatus(fmt.Sprintf("已切换 %s -> %s", row.app.DisplayName(), row.provider.Name), statusSuccess)
+				return m.switchProvider(row.app, *row.provider, false)
 			}
 		}
 	}
@@ -325,6 +338,89 @@ func (m *Model) updateConfirm(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	return m, nil
+}
+
+func (m *Model) updateSwitchConfirm(msg tea.Msg) (tea.Model, tea.Cmd) {
+	if m.switchConfirm == nil {
+		m.mode = modeList
+		return m, nil
+	}
+
+	typed, ok := msg.(tea.KeyMsg)
+	if !ok {
+		return m, nil
+	}
+
+	switch typed.String() {
+	case "q", "esc":
+		m.mode = modeList
+		m.switchConfirm = nil
+		m.setStatus("已取消切换", statusInfo)
+		return m, nil
+	case "r", "space", " ":
+		m.switchConfirm.restoreSession = !m.switchConfirm.restoreSession
+		return m, nil
+	case "n":
+		state := *m.switchConfirm
+		m.mode = modeList
+		m.switchConfirm = nil
+		return m.switchProvider(state.app, state.provider, false)
+	case "enter", "y":
+		state := *m.switchConfirm
+		m.mode = modeList
+		m.switchConfirm = nil
+		return m.switchProvider(state.app, state.provider, state.restoreSession)
+	default:
+		return m, nil
+	}
+}
+
+func (m *Model) switchProvider(app ccswitch.AppType, provider ccswitch.Provider, restoreSession bool) (tea.Model, tea.Cmd) {
+	if err := m.store.SwitchProvider(app, provider.ID); err != nil {
+		m.setStatus(err.Error(), statusError)
+		return m, nil
+	}
+
+	m.selectedKey = providerKey(app, provider.ID)
+	if err := m.reload(); err != nil {
+		m.setStatus(err.Error(), statusError)
+		return m, nil
+	}
+
+	status := fmt.Sprintf("已切换 %s -> %s", app.DisplayName(), provider.Name)
+	statusKind := statusSuccess
+	if restoreSession && app == ccswitch.AppCodex {
+		workspace, err := codex.OpenWorkspace(m.store.CodexConfigDir(), false)
+		if err != nil {
+			status += fmt.Sprintf("；会话恢复失败: %v", err)
+			statusKind = statusError
+		} else {
+			report, err := workspace.SwitchToCurrentProvider(codex.SwitchProviderOptions{})
+			if err != nil {
+				status += fmt.Sprintf("；会话恢复失败: %v", err)
+				statusKind = statusError
+			} else {
+				status += formatSessionRestoreStatus(report)
+			}
+		}
+	}
+
+	m.setStatus(status, statusKind)
+	return m, nil
+}
+
+func formatSessionRestoreStatus(report *codex.RepairReport) string {
+	if report == nil || len(report.Threads) == 0 {
+		if report != nil && len(report.SkippedThreads) > 0 {
+			return fmt.Sprintf("；会话无需恢复，跳过 %d 个", len(report.SkippedThreads))
+		}
+		return "；会话无需恢复"
+	}
+	status := fmt.Sprintf("；已恢复 %d 个会话", len(report.Threads))
+	if len(report.SkippedThreads) > 0 {
+		status += fmt.Sprintf("，跳过 %d 个", len(report.SkippedThreads))
+	}
+	return status
 }
 
 func (m *Model) openAddForm(app ccswitch.AppType) {
@@ -645,6 +741,47 @@ func (m *Model) viewConfirm() string {
 	return strings.Join(page, "\n")
 }
 
+func (m *Model) viewSwitchConfirm() string {
+	if m.switchConfirm == nil {
+		return ""
+	}
+
+	restore := "关闭"
+	if m.switchConfirm.restoreSession {
+		restore = "开启"
+	}
+	body := []string{
+		panelTitleStyle.Render("Switch Provider"),
+		"",
+		fmt.Sprintf("App: %s", m.switchConfirm.app.DisplayName()),
+		fmt.Sprintf("Provider: %s", m.switchConfirm.provider.Name),
+		"",
+	}
+	body = append(body, providerURLLines(m.store, m.switchConfirm.app, m.switchConfirm.provider, max(24, min(m.width-8, 80)-6))...)
+	body = append(body,
+		"",
+		fmt.Sprintf("Codex 会话自动恢复: %s", restore),
+		"切换后会将旧 provider 的会话迁移到当前 provider。",
+	)
+
+	panelLines := strings.Split(panelStyle.Width(max(50, min(m.width-8, 80))).Render(strings.Join(body, "\n")), "\n")
+	helpLines := m.renderHelpLines()
+	page := []string{m.renderHeader()}
+	topPadding := (m.height - len(panelLines) - len(helpLines) - 1) / 2
+	if topPadding < 1 {
+		topPadding = 1
+	}
+	for i := 0; i < topPadding; i++ {
+		page = append(page, "")
+	}
+	page = append(page, panelLines...)
+	for len(page)+len(helpLines) < m.height {
+		page = append(page, "")
+	}
+	page = append(page, helpLines...)
+	return strings.Join(page, "\n")
+}
+
 func (m *Model) renderHeader() string {
 	left := titleStyle.Render("CC Switch TUI") + " " + badgeStyle.Render(m.modeLabel())
 	if m.mode == modeList || m.mode == modeForm {
@@ -805,6 +942,13 @@ func (m *Model) renderHelpLines() []string {
 				help("q/n", "返回"),
 			}
 		}
+	case modeSwitchConfirm:
+		items = []string{
+			help("Enter/y", "切换并按当前选项恢复"),
+			help("r/Space", "开关会话恢复"),
+			help("n", "切换但不恢复"),
+			help("q/Esc", "返回"),
+		}
 	default:
 		items = []string{
 			help("↑/↓ j/k", "移动"),
@@ -951,6 +1095,8 @@ func (m *Model) modeLabel() string {
 		return "新增"
 	case modeConfirm:
 		return "确认"
+	case modeSwitchConfirm:
+		return "切换"
 	default:
 		return "列表"
 	}

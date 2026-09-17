@@ -67,6 +67,12 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
+// CodexConfigDir returns the directory used by Codex live configuration and
+// session data. It honours the optional codexConfigDir override in settings.
+func (s *Store) CodexConfigDir() string {
+	return s.configDirFor(AppCodex)
+}
+
 func (s *Store) Bootstrap() ([]string, error) {
 	var warnings []string
 
