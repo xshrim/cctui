@@ -2,6 +2,7 @@ package ccswitch
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 )
 
@@ -15,6 +16,21 @@ const (
 )
 
 var AllAppTypes = []AppType{AppClaude, AppCodex, AppGemini, AppOpencode}
+
+func ParseAppType(value string) (AppType, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "claude", "claude-code":
+		return AppClaude, nil
+	case "codex":
+		return AppCodex, nil
+	case "gemini", "gemini-cli":
+		return AppGemini, nil
+	case "opencode", "open-code", "open_code":
+		return AppOpencode, nil
+	default:
+		return "", fmt.Errorf("不支持的应用类型: %s", value)
+	}
+}
 
 func (a AppType) String() string {
 	return string(a)

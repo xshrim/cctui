@@ -59,6 +59,172 @@ go build -o cctui .
 ./cctui
 ```
 
+### 供应商导入与导出
+
+#### 导入
+
+支持根据文件后缀自动识别 JSON、YAML 和 YML：
+
+```bash
+cctui import providers.json
+cctui import providers.yaml
+cctui --import-file providers.yml
+```
+
+导入文件支持以下三种模式。
+
+#### 统一 `providers` 数组
+
+JSON 示例：
+
+```json
+{
+  "providers": [
+    {
+      "app": "claude",
+      "name": "Claude Relay",
+      "base_url": "https://api.example.com",
+      "api_key": "your-key",
+      "model": "claude-sonnet",
+      "reasoning_effort": "high",
+      "website": "https://api.example.com",
+      "notes": "Claude 工作账号"
+    },
+    {
+      "app": "codex",
+      "name": "Codex Relay",
+      "base_url": "https://api.example.com/v1",
+      "api_key": "your-key",
+      "model": "gpt-5.6",
+      "reasoning_effort": "high",
+      "website": "https://api.example.com",
+      "notes": "Codex Responses 供应商"
+    },
+    {
+      "app": "gemini",
+      "name": "Gemini Relay",
+      "base_url": "https://generativelanguage.googleapis.com",
+      "api_key": "your-key",
+      "model": "gemini-2.5-pro",
+      "reasoning_effort": "medium",
+      "website": "https://ai.google.dev",
+      "notes": "Gemini API Key 供应商"
+    },
+    {
+      "app": "opencode",
+      "name": "OpenCode Relay",
+      "base_url": "https://api.example.com/v1",
+      "api_key": "your-key",
+      "model": "deepseek-chat",
+      "reasoning_effort": "high",
+      "website": "https://api.example.com",
+      "notes": "OpenCode provider"
+    }
+  ]
+}
+```
+
+#### 按应用分组
+
+YAML 示例。分组名就是应用类型，因此每个条目可以省略 `app`：
+
+```yaml
+claude:
+  - name: Claude Relay
+    base_url: https://api.example.com
+    api_key: your-claude-key
+    model: claude-sonnet
+    reasoning_effort: high
+    website: https://api.example.com
+    notes: Claude 供应商
+
+codex:
+  - name: Codex Relay
+    base_url: https://api.example.com/v1
+    api_key: your-codex-key
+    model: gpt-5.6
+    reasoning_effort: high
+    website: https://api.example.com
+    notes: Codex Responses 供应商
+
+gemini:
+  - name: Gemini Relay
+    base_url: https://generativelanguage.googleapis.com
+    api_key: your-gemini-key
+    model: gemini-2.5-pro
+    reasoning_effort: medium
+    website: https://ai.google.dev
+    notes: Gemini 供应商
+
+opencode:
+  - name: OpenCode Relay
+    base_url: https://api.example.com/v1
+    api_key: your-opencode-key
+    model: deepseek-chat
+    reasoning_effort: high
+    website: https://api.example.com
+    notes: OpenCode 供应商
+```
+
+#### 顶层直接数组
+
+JSON 和 YAML 都支持顶层直接数组。此时每个条目必须填写 `app` 或 `app_type`：
+
+```yaml
+- app_type: claude
+  name: Claude Official
+  base_url: https://api.anthropic.com
+  api_key: sk-ant-your-key
+  model: claude-sonnet
+  reasoning_effort: high
+  website: https://anthropic.com
+  notes: 官方 Claude API
+
+- app_type: codex
+  name: Codex Official
+  base_url: https://api.openai.com/v1
+  api_key: sk-your-key
+  model: gpt-5.6
+  reasoning_effort: high
+  website: https://openai.com
+  notes: 官方 Codex API
+```
+
+支持的应用名为 `claude`、`codex`、`gemini`、`opencode`，也接受 `claude-code`、`gemini-cli` 等别名。
+
+字段说明：
+
+| 字段 | 必填 | 说明 |
+|------|------|------|
+| `app` / `app_type` | 统一数组和顶层数组必填 | 目标应用；分组模式由分组名自动确定 |
+| `name` | 是 | 供应商显示名称 |
+| `base_url` / `baseURL` | 否 | API 基础地址；留空表示沿用官方登录或默认端点 |
+| `api_key` / `apiKey` | 否 | API Key；留空时保留 OAuth/登录语义 |
+| `model` | 否 | 默认模型 |
+| `reasoning_effort` / `reasoningEffort` | 否 | Codex 的 Reasoning Effort，例如 `low`、`medium`、`high`；其他应用即使填写也不会使用 |
+| `website` | 否 | 供应商官网或控制台地址 |
+| `notes` | 否 | 供应商备注 |
+
+导入会复用正常供应商创建流程，并写入数据库和对应 live 配置。导入不会清空已有供应商：同一应用下名称相同（忽略名称大小写和首尾空格）的供应商会被覆盖，其他供应商会追加保留。文件后缀大小写不敏感；不支持的后缀会直接拒绝。导入结果会分别输出追加、覆盖和失败条目，存在失败时命令返回非零状态码。
+
+#### 导出
+
+导出使用和导入相同的规范化格式，并根据文件后缀自动选择 JSON、YAML 或 YML：
+
+```bash
+cctui export providers.json
+cctui export providers.yaml
+cctui --export-file providers.yml
+```
+
+导出文件默认包含 API Key，以便直接再次导入。若只需要分享供应商地址和模型信息，可以脱敏导出：
+
+```bash
+cctui export providers.yaml --redact-secrets
+```
+
+脱敏文件中的 API Key 为 `[REDACTED]`，不能直接用于实际连接；导出文件包含敏感信息时会以 `0600` 权限原子写入。
+
 ## AUR 自动发布
 
 仓库内置了 GitHub Actions workflow：当你给 GitHub 仓库 push 一个 tag 时，会自动更新 AUR 仓库：
