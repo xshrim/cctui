@@ -21,6 +21,7 @@ import (
 
 const (
 	opencodeProviderKeyMeta = "opencodeProviderKey"
+	grokModelKeyMeta        = "grokModelKey"
 	geminiAuthModeAPIKey    = "gemini-api-key"
 	geminiAuthModeOAuth     = "oauth-personal"
 	geminiAuthModeVertex    = "vertex-ai"
@@ -117,6 +118,8 @@ func (s *Store) ConfigPaths(app AppType) []string {
 		return []string{s.codexAuthPath(), s.codexConfigPath()}
 	case AppGemini:
 		return []string{s.geminiEnvPath(), s.geminiSettingsPath()}
+	case AppGrok:
+		return []string{s.grokConfigPath()}
 	case AppOpencode:
 		return []string{s.opencodeConfigPath()}
 	default:
@@ -612,6 +615,18 @@ func (s *Store) ExtractInput(app AppType, provider Provider) ProviderInput {
 			Website:        deref(provider.WebsiteURL),
 			Notes:          deref(provider.Notes),
 		}
+	case AppGrok:
+		config := getOrCreateMap(provider.SettingsConfig, "config")
+		modelKey := grokModelKeyForProvider(provider)
+		model := mapValue(config, "model", modelKey)
+		return ProviderInput{
+			Name:    provider.Name,
+			BaseURL: stringValue(model["base_url"]),
+			APIKey:  stringValue(model["api_key"]),
+			Model:   firstNonEmpty(stringValue(model["model"]), modelKey),
+			Website: deref(provider.WebsiteURL),
+			Notes:   deref(provider.Notes),
+		}
 	case AppOpencode:
 		options, modelsMap := opencodeProviderConfigForProvider(provider)
 		firstModelName := firstMapKey(modelsMap)
@@ -652,6 +667,13 @@ func (s *Store) EndpointSummary(app AppType, provider Provider) string {
 			return "Google OAuth"
 		}
 		return summarizeURL(baseURL)
+	case AppGrok:
+		config := getOrCreateMap(provider.SettingsConfig, "config")
+		model := mapValue(config, "model", grokModelKeyForProvider(provider))
+		if baseURL := strings.TrimSpace(stringValue(model["base_url"])); baseURL != "" {
+			return summarizeURL(baseURL)
+		}
+		return "官方登录"
 	case AppOpencode:
 		options, _ := opencodeProviderConfigForProvider(provider)
 		if baseURL := strings.TrimSpace(stringValue(options["baseURL"])); baseURL != "" {
@@ -661,6 +683,35 @@ func (s *Store) EndpointSummary(app AppType, provider Provider) string {
 	default:
 		return "-"
 	}
+}
+
+func mapValue(parent map[string]any, key, child string) map[string]any {
+	values, _ := parent[key].(map[string]any)
+	if values == nil {
+		return map[string]any{}
+	}
+	value, _ := values[child].(map[string]any)
+	if value == nil {
+		return map[string]any{}
+	}
+	return value
+}
+
+func grokDefaultModelKey(config map[string]any) string {
+	defaults := getOrCreateMap(config, "models")
+	if key := strings.TrimSpace(stringValue(defaults["default"])); key != "" {
+		return key
+	}
+	models := getOrCreateMap(config, "model")
+	return firstMapKey(models)
+}
+
+func grokModelKeyForProvider(provider Provider) string {
+	if key := stringValue(provider.Meta[grokModelKeyMeta]); key != "" {
+		return key
+	}
+	config := getOrCreateMap(provider.SettingsConfig, "config")
+	return grokDefaultModelKey(config)
 }
 
 func (s *Store) ensureSchema() error {
@@ -730,6 +781,16 @@ func (s *Store) importCurrentLive(app AppType) (bool, error) {
 	}
 	if app == AppGemini {
 		provider.Meta["geminiAuthMode"] = detectGeminiAuthMode(live)
+	}
+	if app == AppGrok {
+		config := getOrCreateMap(live, "config")
+		key := grokDefaultModelKey(config)
+		if key != "" {
+			provider.Meta[grokModelKeyMeta] = key
+			if model := mapValue(config, "model", key); stringValue(model["name"]) != "" {
+				provider.Name = stringValue(model["name"])
+			}
+		}
 	}
 
 	if err := s.saveProviderRow(app, provider); err != nil {
@@ -995,6 +1056,51 @@ func (s *Store) buildProvider(app AppType, existing *Provider, input ProviderInp
 		provider.Meta["geminiAuthMode"] = authMode
 		provider.SettingsConfig = settings
 
+	case AppGrok:
+		settings := CloneMap(provider.SettingsConfig)
+		config := getOrCreateMap(settings, "config")
+		if len(config) == 0 && existing == nil {
+			if live, liveErr := s.readLiveSettings(AppGrok); liveErr == nil {
+				config = getOrCreateMap(live, "config")
+			}
+		}
+		modelKey := id
+		if existing != nil {
+			modelKey = grokModelKeyForProvider(*existing)
+		}
+		if modelKey == "" {
+			modelKey = id
+		}
+		models := getOrCreateMap(config, "model")
+		entry, _ := models[modelKey].(map[string]any)
+		if entry == nil {
+			if defaultKey := grokDefaultModelKey(config); defaultKey != "" {
+				entry = CloneMap(mapValue(config, "model", defaultKey))
+			}
+		}
+		if entry == nil {
+			entry = map[string]any{}
+		} else {
+			entry = CloneMap(entry)
+		}
+		patchStringField(entry, "base_url", input.BaseURL)
+		patchStringField(entry, "api_key", input.APIKey)
+		patchStringField(entry, "model", input.Model)
+		if strings.TrimSpace(input.Name) != "" {
+			entry["name"] = strings.TrimSpace(input.Name)
+		}
+		models[modelKey] = entry
+		config["model"] = models
+		defaults := getOrCreateMap(config, "models")
+		defaults["default"] = modelKey
+		config["models"] = defaults
+		if provider.Meta == nil {
+			provider.Meta = map[string]any{}
+		}
+		provider.Meta[grokModelKeyMeta] = modelKey
+		settings["config"] = config
+		provider.SettingsConfig = settings
+
 	case AppOpencode:
 		settings := CloneMap(provider.SettingsConfig)
 		provKey := id
@@ -1149,6 +1255,23 @@ func (s *Store) readLiveSettings(app AppType) (map[string]any, error) {
 
 		return result, nil
 
+	case AppGrok:
+		path := s.grokConfigPath()
+		content, err := os.ReadFile(path)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return nil, os.ErrNotExist
+			}
+			return nil, fmt.Errorf("读取 Grok config.toml 失败: %w", err)
+		}
+		config := map[string]any{}
+		if len(strings.TrimSpace(string(content))) > 0 {
+			if err := toml.Unmarshal(content, &config); err != nil {
+				return nil, fmt.Errorf("解析 Grok config.toml 失败: %w", err)
+			}
+		}
+		return map[string]any{"config": config}, nil
+
 	case AppOpencode:
 		path := s.opencodeConfigPath()
 		content, err := os.ReadFile(path)
@@ -1178,11 +1301,23 @@ func (s *Store) writeLiveSettings(app AppType, provider Provider) error {
 		return writeCodexLiveAtomic(s.codexAuthPath(), s.codexConfigPath(), auth, config)
 	case AppGemini:
 		return s.writeGeminiLive(provider)
+	case AppGrok:
+		return s.writeGrokLive(provider)
 	case AppOpencode:
 		return s.writeOpencodeLive(provider)
 	default:
 		return fmt.Errorf("不支持的应用类型: %s", app)
 	}
+}
+
+func (s *Store) writeGrokLive(provider Provider) error {
+	settings := CloneMap(provider.SettingsConfig)
+	config := getOrCreateMap(settings, "config")
+	data, err := toml.Marshal(config)
+	if err != nil {
+		return fmt.Errorf("生成 Grok config.toml 失败: %w", err)
+	}
+	return writeTextAtomic(s.grokConfigPath(), string(data))
 }
 
 func (s *Store) writeGeminiLive(provider Provider) error {
@@ -1516,6 +1651,10 @@ func (s *Store) geminiSettingsPath() string {
 	return filepath.Join(s.configDirFor(AppGemini), "settings.json")
 }
 
+func (s *Store) grokConfigPath() string {
+	return filepath.Join(s.configDirFor(AppGrok), "config.toml")
+}
+
 func (s *Store) opencodeConfigPath() string {
 	if custom := strings.TrimSpace(os.Getenv("OPENCODE_CONFIG")); custom != "" {
 		return resolveOverridePath(custom)
@@ -1584,6 +1723,8 @@ func (s *Store) liveFilesBytes(app AppType) ([]liveFileBytes, error) {
 		paths = []string{s.codexAuthPath(), s.codexConfigPath()}
 	case AppGemini:
 		paths = []string{s.geminiEnvPath(), s.geminiSettingsPath()}
+	case AppGrok:
+		paths = []string{s.grokConfigPath()}
 	case AppOpencode:
 		paths = []string{s.opencodeConfigPath()}
 	default:
@@ -1620,6 +1761,8 @@ func (s *Store) configDirFor(app AppType) string {
 		return filepath.Join(homeDir(), ".codex")
 	case AppGemini:
 		return filepath.Join(homeDir(), ".gemini")
+	case AppGrok:
+		return filepath.Join(homeDir(), ".grok")
 	case AppOpencode:
 		if xdg := strings.TrimSpace(os.Getenv("XDG_CONFIG_HOME")); xdg != "" {
 			return filepath.Join(resolveOverridePath(xdg), "opencode")
@@ -1639,6 +1782,8 @@ func nativeConfigDir(app AppType) string {
 		envKey = "CODEX_HOME"
 	case AppGemini:
 		envKey = "GEMINI_CLI_HOME"
+	case AppGrok:
+		envKey = "GROK_HOME"
 	case AppOpencode:
 		envKey = "OPENCODE_CONFIG_DIR"
 	}
@@ -1703,6 +1848,8 @@ func currentProviderKey(app AppType) string {
 		return "currentProviderCodex"
 	case AppGemini:
 		return "currentProviderGemini"
+	case AppGrok:
+		return "currentProviderGrok"
 	default:
 		return ""
 	}
@@ -1716,6 +1863,8 @@ func configDirKey(app AppType) string {
 		return "codexConfigDir"
 	case AppGemini:
 		return "geminiConfigDir"
+	case AppGrok:
+		return "grokConfigDir"
 	case AppOpencode:
 		return "opencodeConfigDir"
 	default:

@@ -7,6 +7,8 @@ import (
 	"net/url"
 	"os"
 	"strings"
+
+	toml "github.com/pelletier/go-toml/v2"
 )
 
 // SwitchFileDiff contains the redacted diff for one live configuration file.
@@ -141,6 +143,14 @@ func (s *Store) previewTargetFiles(app AppType, provider Provider) ([]previewFil
 
 	case AppGemini:
 		return s.previewGeminiFiles(provider)
+	case AppGrok:
+		settings := CloneMap(provider.SettingsConfig)
+		config := getOrCreateMap(settings, "config")
+		data, err := toml.Marshal(config)
+		if err != nil {
+			return nil, fmt.Errorf("生成 Grok 配置预览失败: %w", err)
+		}
+		return []previewFile{{path: s.grokConfigPath(), kind: previewText, data: data}}, nil
 	default:
 		return nil, fmt.Errorf("不支持的应用类型: %s", app)
 	}

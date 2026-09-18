@@ -10,6 +10,7 @@ import (
 
 	"cctui/internal/ccswitch"
 	"cctui/internal/codex"
+	"cctui/internal/grok"
 )
 
 type screenMode int
@@ -206,6 +207,8 @@ func (m *Model) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "3":
 			m.jumpToApp(ccswitch.AppGemini)
 		case "4":
+			m.jumpToApp(ccswitch.AppGrok)
+		case "5":
 			m.jumpToApp(ccswitch.AppOpencode)
 		case "a":
 			row := m.selectedRow()
@@ -255,7 +258,7 @@ func (m *Model) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.switchConfirm = &switchConfirmState{
 					app:            row.app,
 					provider:       *row.provider,
-					restoreSession: row.app == ccswitch.AppCodex,
+					restoreSession: sessionRestoreEnabled(row.app),
 					preview:        preview,
 				}
 				m.mode = modeSwitchConfirm
@@ -387,12 +390,12 @@ func (m *Model) updateSwitchConfirm(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.switchConfirm.diffOffset = 0
 		return m, nil
 	case "r", "space", " ":
-		if m.switchConfirm.app == ccswitch.AppCodex {
+		if sessionRestoreEnabled(m.switchConfirm.app) {
 			m.switchConfirm.restoreSession = !m.switchConfirm.restoreSession
 		}
 		return m, nil
 	case "n":
-		if m.switchConfirm.app != ccswitch.AppCodex {
+		if !sessionRestoreEnabled(m.switchConfirm.app) {
 			m.mode = modeList
 			m.switchConfirm = nil
 			m.setStatus("已取消切换", statusInfo)
@@ -439,6 +442,17 @@ func (m *Model) switchProvider(app ccswitch.AppType, provider ccswitch.Provider,
 			} else {
 				status += formatSessionRestoreStatus(report)
 			}
+		}
+	} else if restoreSession && app == ccswitch.AppGrok {
+		input := m.store.ExtractInput(app, provider)
+		report, err := grok.SwitchToModel(m.store.ConfigDir(ccswitch.AppGrok), input.Model)
+		if err != nil {
+			status += fmt.Sprintf("；会话恢复失败: %v", err)
+			statusKind = statusError
+		} else if report.Updated > 0 {
+			status += fmt.Sprintf("；已恢复 %d 个会话", report.Updated)
+		} else {
+			status += "；会话无需恢复"
 		}
 	}
 
@@ -850,11 +864,11 @@ func (m *Model) viewSwitchConfirm() string {
 		}
 	}
 
-	if m.switchConfirm.app == ccswitch.AppCodex {
+	if sessionRestoreEnabled(m.switchConfirm.app) {
 		body = append(body,
 			"",
-			fmt.Sprintf("Codex 会话自动恢复: %s", restore),
-			"切换后会将旧 provider 的会话迁移到当前 provider。",
+			fmt.Sprintf("%s 会话自动恢复: %s", m.switchConfirm.app.DisplayName(), restore),
+			"切换后会将历史会话切换到当前模型。",
 		)
 	} else {
 		body = append(body, "", "确认后才会写入 live 配置。")
@@ -1039,7 +1053,7 @@ func (m *Model) renderHelpLines() []string {
 		}
 	case modeSwitchConfirm:
 		items = []string{help("Enter/y", "确认切换"), help("↑/↓ j/k", "滚动 Diff"), help("PgUp/PgDn", "翻页")}
-		if m.switchConfirm != nil && m.switchConfirm.app == ccswitch.AppCodex {
+		if m.switchConfirm != nil && sessionRestoreEnabled(m.switchConfirm.app) {
 			items = append(items, help("r/Space", "开关会话恢复"), help("n", "切换但不恢复"))
 		}
 		items = append(items, help("q/Esc", "返回"))
@@ -1050,12 +1064,16 @@ func (m *Model) renderHelpLines() []string {
 			help("a", "添加"),
 			help("e", "编辑"),
 			help("d", "删除"),
-			help("1/2/3/4", "跳应用"),
+			help("1/2/3/4/5", "跳应用"),
 			help("g/G", "顶/底"),
 			help("q", "退出"),
 		}
 	}
 	return wrapInlineItems(items, max(20, m.width-2))
+}
+
+func sessionRestoreEnabled(app ccswitch.AppType) bool {
+	return app == ccswitch.AppCodex || app == ccswitch.AppGrok
 }
 
 func newFormState(app ccswitch.AppType, provider *ccswitch.Provider, input ccswitch.ProviderInput) formState {
@@ -1247,6 +1265,8 @@ func placeholderFor(app ccswitch.AppType, label string) string {
 			return "e.g. https://api.openai.com/v1"
 		case ccswitch.AppGemini:
 			return "e.g. https://generativelanguage.googleapis.com"
+		case ccswitch.AppGrok:
+			return "e.g. https://api.x.ai/v1"
 		}
 	case "API Key":
 		return "Leave empty to keep OAuth / login semantics"
@@ -1258,6 +1278,8 @@ func placeholderFor(app ccswitch.AppType, label string) string {
 			return "e.g. gpt-5-codex"
 		case ccswitch.AppGemini:
 			return "e.g. gemini-2.5-pro"
+		case ccswitch.AppGrok:
+			return "e.g. grok-4.6"
 		}
 	case "Reasoning Effort":
 		return "e.g. medium / high"
@@ -1293,6 +1315,8 @@ func providerBaseURLFallback(app ccswitch.AppType) string {
 		return "官方登录"
 	case ccswitch.AppGemini:
 		return "Google OAuth"
+	case ccswitch.AppGrok:
+		return "官方登录"
 	default:
 		return "-"
 	}

@@ -1,6 +1,6 @@
 # CC Switch TUI
 
-`CC Switch TUI` 是一个终端界面工具，用来管理并切换 `Claude`、`Codex`、`Gemini`、`Opencode` 的多套供应商配置。
+`CC Switch TUI` 是一个终端界面工具，用来管理并切换 `Claude`、`Codex`、`Gemini`、`Grok`、`Opencode` 的多套供应商配置。
 
 它适合以下场景：
 
@@ -10,8 +10,8 @@
 
 ## 功能特性
 
-- 支持 `Claude`、`Codex`、`Gemini`、`Opencode` 四类应用
-- `Claude`、`Codex`、`Gemini` 为替换模式：同一时刻只有一个供应商生效
+- 支持 `Claude`、`Codex`、`Gemini`、`Grok`、`Opencode` 五类应用
+- `Claude`、`Codex`、`Gemini`、`Grok` 为替换模式：同一时刻只有一个供应商生效
 - `Opencode` 为增量模式 `(I)`：所有供应商共存于同一配置文件
 - 使用 SQLite 保存供应商配置，数据默认位于 `~/.cc-switch/`
 - 首次启动时，如果某个应用还没有保存的供应商，会尝试导入当前 live 配置
@@ -19,7 +19,7 @@
 - 切换前会检测 live 配置是否被外部修改；发现冲突时会取消切换，避免静默覆盖
 - 支持新增、编辑、删除、切换供应商
 - `Codex` 额外支持配置 `Reasoning Effort`
-- 切换 `Codex` 供应商时可选择自动恢复历史会话
+- 切换 `Codex` 或 `Grok` 供应商时可选择自动恢复历史会话
 
 ## 管理的配置文件
 
@@ -31,6 +31,7 @@
 - `Codex`：`~/.codex/config.toml`
 - `Gemini`：`~/.gemini/.env`
 - `Gemini`：`~/.gemini/settings.json`
+- `Grok`：`~/.grok/config.toml`
 - `Opencode`：`~/.config/opencode/opencode.json`（或 `opencode.jsonc`）
 
 程序自己的本地数据默认保存在：
@@ -111,6 +112,15 @@ JSON 示例：
       "notes": "Gemini API Key 供应商"
     },
     {
+      "app": "grok",
+      "name": "Grok Relay",
+      "base_url": "https://api.x.ai/v1",
+      "api_key": "your-key",
+      "model": "grok-4.6",
+      "website": "https://x.ai",
+      "notes": "Grok provider"
+    },
+    {
       "app": "opencode",
       "name": "OpenCode Relay",
       "base_url": "https://api.example.com/v1",
@@ -156,6 +166,14 @@ gemini:
     website: https://ai.google.dev
     notes: Gemini 供应商
 
+grok:
+  - name: Grok Relay
+    base_url: https://api.x.ai/v1
+    api_key: your-grok-key
+    model: grok-4.6
+    website: https://x.ai
+    notes: Grok 供应商
+
 opencode:
   - name: OpenCode Relay
     base_url: https://api.example.com/v1
@@ -190,7 +208,7 @@ JSON 和 YAML 都支持顶层直接数组。此时每个条目必须填写 `app`
   notes: 官方 Codex API
 ```
 
-支持的应用名为 `claude`、`codex`、`gemini`、`opencode`，也接受 `claude-code`、`gemini-cli` 等别名。
+支持的应用名为 `claude`、`codex`、`gemini`、`grok`、`opencode`，也接受 `claude-code`、`gemini-cli`、`grok-cli` 等别名。
 
 字段说明：
 
@@ -266,12 +284,12 @@ cctui export providers.yaml --redact-secrets
 
 - `Enter`：替换模式下先预览配置 Diff，确认后才切换；增量模式下进入编辑
 - 预览页面：`↑/↓` 或 `j/k` 滚动 Diff，`Enter` / `y` 确认切换，`q` / `Esc` 取消
-- 切换 `Codex` 时：`r` / `Space` 开关会话恢复，`Enter` / `y` 确认并按当前选项执行，`n` 仅切换不恢复
+- 切换 `Codex` 或 `Grok` 时：`r` / `Space` 开关会话恢复，`Enter` / `y` 确认并按当前选项执行，`n` 仅切换不恢复
 - `a`：新增供应商
 - `e`：编辑供应商
 - `d`：删除供应商
 - `↑/↓` 或 `j/k`：移动光标
-- `1/2/3/4`：快速跳转到 `Claude` / `Codex` / `Gemini` / `Opencode`
+- `1/2/3/4/5`：快速跳转到 `Claude` / `Codex` / `Gemini` / `Grok` / `Opencode`
 - `g/G`：跳到顶部 / 底部
 - `q`：退出
 
@@ -315,6 +333,10 @@ cctui export providers.yaml --redact-secrets
 
 恢复会话时会校验 rollout 路径位于 Codex 会话目录内，并校验 rollout 的线程 ID；保留原有归档和用户事件状态，session index 使用临时文件原子替换。
 
+### Grok 会话恢复
+
+切换 `Grok` 供应商时可选择自动恢复历史会话。程序会更新 `$GROK_HOME/sessions` 下会话摘要中的当前模型，并为每个修改的摘要创建 `.bak.session-restore-*` 备份。
+
 ### OpenCode 增量模式
 
 OpenCode 的每个 provider 按 `opencode.json` 中真实的 provider key 独立保存，不使用当前供应商状态。新增、编辑、删除 provider 时会保留其他 provider、额外模型及 provider-level 字段。
@@ -328,6 +350,7 @@ OpenCode 的每个 provider 按 `opencode.json` 中真实的 provider key 独立
   "claudeConfigDir": "/path/to/.claude",
   "codexConfigDir": "/path/to/.codex",
   "geminiConfigDir": "/path/to/.gemini",
+  "grokConfigDir": "/path/to/.grok",
   "opencodeConfigDir": "/path/to/.config/opencode"
 }
 ```
@@ -339,6 +362,7 @@ OpenCode 的每个 provider 按 `opencode.json` 中真实的 provider key 独立
 - `Claude`：`CLAUDE_CONFIG_DIR`
 - `Codex`：`CODEX_HOME`
 - `Gemini`：`GEMINI_CLI_HOME`
+- `Grok`：`GROK_HOME`
 - `Opencode`：`OPENCODE_CONFIG`（完整配置文件）或 `OPENCODE_CONFIG_DIR`（配置目录）
 - Linux 下未设置 OpenCode 专用变量时，也会识别 `XDG_CONFIG_HOME/opencode`
 

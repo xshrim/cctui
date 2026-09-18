@@ -12,10 +12,11 @@ const (
 	AppClaude   AppType = "claude"
 	AppCodex    AppType = "codex"
 	AppGemini   AppType = "gemini"
+	AppGrok     AppType = "grok"
 	AppOpencode AppType = "opencode"
 )
 
-var AllAppTypes = []AppType{AppClaude, AppCodex, AppGemini, AppOpencode}
+var AllAppTypes = []AppType{AppClaude, AppCodex, AppGemini, AppGrok, AppOpencode}
 
 func ParseAppType(value string) (AppType, error) {
 	switch strings.ToLower(strings.TrimSpace(value)) {
@@ -25,6 +26,8 @@ func ParseAppType(value string) (AppType, error) {
 		return AppCodex, nil
 	case "gemini", "gemini-cli":
 		return AppGemini, nil
+	case "grok", "grok-cli", "grok-build":
+		return AppGrok, nil
 	case "opencode", "open-code", "open_code":
 		return AppOpencode, nil
 	default:
@@ -44,6 +47,8 @@ func (a AppType) DisplayName() string {
 		return "Codex"
 	case AppGemini:
 		return "Gemini"
+	case AppGrok:
+		return "Grok"
 	case AppOpencode:
 		return "Opencode"
 	default:
