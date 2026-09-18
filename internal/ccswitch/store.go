@@ -22,6 +22,7 @@ import (
 const (
 	opencodeProviderKeyMeta = "opencodeProviderKey"
 	grokModelKeyMeta        = "grokModelKey"
+	piProviderKeyMeta       = "piProviderKey"
 	geminiAuthModeAPIKey    = "gemini-api-key"
 	geminiAuthModeOAuth     = "oauth-personal"
 	geminiAuthModeVertex    = "vertex-ai"
@@ -120,6 +121,8 @@ func (s *Store) ConfigPaths(app AppType) []string {
 		return []string{s.geminiEnvPath(), s.geminiSettingsPath()}
 	case AppGrok:
 		return []string{s.grokConfigPath()}
+	case AppPi:
+		return []string{s.piModelsPath(), s.piAuthPath(), s.piSettingsPath()}
 	case AppOpencode:
 		return []string{s.opencodeConfigPath()}
 	default:
@@ -627,6 +630,26 @@ func (s *Store) ExtractInput(app AppType, provider Provider) ProviderInput {
 			Website: deref(provider.WebsiteURL),
 			Notes:   deref(provider.Notes),
 		}
+	case AppPi:
+		models := getOrCreateMap(provider.SettingsConfig, "models")
+		auth := getOrCreateMap(provider.SettingsConfig, "auth")
+		settings := getOrCreateMap(provider.SettingsConfig, "settings")
+		key := piProviderKeyForProvider(provider)
+		entry := mapValue(models, "providers", key)
+		modelsList, _ := entry["models"].([]any)
+		model := map[string]any{}
+		if len(modelsList) > 0 {
+			model, _ = modelsList[0].(map[string]any)
+		}
+		credential := directMapValue(auth, key)
+		return ProviderInput{
+			Name:    firstNonEmpty(stringValue(model["name"]), provider.Name),
+			BaseURL: stringValue(entry["baseUrl"]),
+			APIKey:  firstNonEmpty(stringValue(entry["apiKey"]), stringValue(credential["key"])),
+			Model:   firstNonEmpty(stringValue(model["id"]), stringValue(settings["defaultModel"])),
+			Website: deref(provider.WebsiteURL),
+			Notes:   deref(provider.Notes),
+		}
 	case AppOpencode:
 		options, modelsMap := opencodeProviderConfigForProvider(provider)
 		firstModelName := firstMapKey(modelsMap)
@@ -674,6 +697,13 @@ func (s *Store) EndpointSummary(app AppType, provider Provider) string {
 			return summarizeURL(baseURL)
 		}
 		return "官方登录"
+	case AppPi:
+		models := getOrCreateMap(provider.SettingsConfig, "models")
+		entry := mapValue(models, "providers", piProviderKeyForProvider(provider))
+		if baseURL := strings.TrimSpace(stringValue(entry["baseUrl"])); baseURL != "" {
+			return summarizeURL(baseURL)
+		}
+		return "官方登录"
 	case AppOpencode:
 		options, _ := opencodeProviderConfigForProvider(provider)
 		if baseURL := strings.TrimSpace(stringValue(options["baseURL"])); baseURL != "" {
@@ -697,6 +727,14 @@ func mapValue(parent map[string]any, key, child string) map[string]any {
 	return value
 }
 
+func directMapValue(parent map[string]any, key string) map[string]any {
+	value, _ := parent[key].(map[string]any)
+	if value == nil {
+		return map[string]any{}
+	}
+	return value
+}
+
 func grokDefaultModelKey(config map[string]any) string {
 	defaults := getOrCreateMap(config, "models")
 	if key := strings.TrimSpace(stringValue(defaults["default"])); key != "" {
@@ -712,6 +750,20 @@ func grokModelKeyForProvider(provider Provider) string {
 	}
 	config := getOrCreateMap(provider.SettingsConfig, "config")
 	return grokDefaultModelKey(config)
+}
+
+func piProviderKeyForProvider(provider Provider) string {
+	if key := stringValue(provider.Meta[piProviderKeyMeta]); key != "" {
+		return key
+	}
+	models := getOrCreateMap(provider.SettingsConfig, "models")
+	settings := getOrCreateMap(provider.SettingsConfig, "settings")
+	if key := stringValue(settings["defaultProvider"]); key != "" {
+		if directMapValue(getOrCreateMap(models, "providers"), key) != nil {
+			return key
+		}
+	}
+	return firstMapKey(getOrCreateMap(models, "providers"))
 }
 
 func (s *Store) ensureSchema() error {
@@ -789,6 +841,21 @@ func (s *Store) importCurrentLive(app AppType) (bool, error) {
 			provider.Meta[grokModelKeyMeta] = key
 			if model := mapValue(config, "model", key); stringValue(model["name"]) != "" {
 				provider.Name = stringValue(model["name"])
+			}
+		}
+	}
+	if app == AppPi {
+		models := getOrCreateMap(live, "models")
+		settings := getOrCreateMap(live, "settings")
+		key := strings.TrimSpace(stringValue(settings["defaultProvider"]))
+		if key == "" {
+			key = firstMapKey(getOrCreateMap(models, "providers"))
+		}
+		if key != "" {
+			provider.Meta[piProviderKeyMeta] = key
+			entry := mapValue(models, "providers", key)
+			if name := stringValue(entry["name"]); name != "" {
+				provider.Name = name
 			}
 		}
 	}
@@ -1101,6 +1168,57 @@ func (s *Store) buildProvider(app AppType, existing *Provider, input ProviderInp
 		settings["config"] = config
 		provider.SettingsConfig = settings
 
+	case AppPi:
+		settings := CloneMap(provider.SettingsConfig)
+		models := getOrCreateMap(settings, "models")
+		auth := getOrCreateMap(settings, "auth")
+		piSettings := getOrCreateMap(settings, "settings")
+		key := id
+		if existing != nil {
+			key = piProviderKeyForProvider(*existing)
+		}
+		if key == "" {
+			key = id
+		}
+		providers := getOrCreateMap(models, "providers")
+		entry := directMapValue(providers, key)
+		if len(entry) == 0 {
+			entry = map[string]any{}
+		} else {
+			entry = CloneMap(entry)
+		}
+		patchStringField(entry, "baseUrl", input.BaseURL)
+		patchStringField(entry, "apiKey", input.APIKey)
+		entry["api"] = firstNonEmpty(stringValue(entry["api"]), "openai-completions")
+		modelID := strings.TrimSpace(input.Model)
+		if modelID == "" {
+			modelID = key
+		}
+		entry["models"] = []any{map[string]any{"id": modelID, "name": firstNonEmpty(input.Name, modelID)}}
+		providers[key] = entry
+		models["providers"] = providers
+		piSettings["defaultProvider"] = key
+		piSettings["defaultModel"] = modelID
+		authEntry := directMapValue(auth, key)
+		if authEntry == nil || len(authEntry) == 0 {
+			authEntry = map[string]any{}
+		}
+		if strings.TrimSpace(input.APIKey) != "" {
+			authEntry["type"] = "api_key"
+			authEntry["key"] = strings.TrimSpace(input.APIKey)
+			auth[key] = authEntry
+		} else {
+			delete(auth, key)
+		}
+		if provider.Meta == nil {
+			provider.Meta = map[string]any{}
+		}
+		provider.Meta[piProviderKeyMeta] = key
+		settings["models"] = models
+		settings["auth"] = auth
+		settings["settings"] = piSettings
+		provider.SettingsConfig = settings
+
 	case AppOpencode:
 		settings := CloneMap(provider.SettingsConfig)
 		provKey := id
@@ -1272,6 +1390,37 @@ func (s *Store) readLiveSettings(app AppType) (map[string]any, error) {
 		}
 		return map[string]any{"config": config}, nil
 
+	case AppPi:
+		paths := []string{s.piModelsPath(), s.piAuthPath(), s.piSettingsPath()}
+		doc := map[string]any{}
+		for _, path := range paths {
+			content, readErr := os.ReadFile(path)
+			if readErr != nil {
+				if errors.Is(readErr, os.ErrNotExist) {
+					continue
+				}
+				return nil, fmt.Errorf("读取 Pi 配置失败: %w", readErr)
+			}
+			value := map[string]any{}
+			if len(strings.TrimSpace(string(content))) > 0 {
+				if err := json.Unmarshal(content, &value); err != nil {
+					return nil, fmt.Errorf("解析 Pi 配置失败: %w", err)
+				}
+			}
+			switch path {
+			case s.piModelsPath():
+				doc["models"] = value
+			case s.piAuthPath():
+				doc["auth"] = value
+			case s.piSettingsPath():
+				doc["settings"] = value
+			}
+		}
+		if len(doc) == 0 {
+			return nil, os.ErrNotExist
+		}
+		return doc, nil
+
 	case AppOpencode:
 		path := s.opencodeConfigPath()
 		content, err := os.ReadFile(path)
@@ -1303,11 +1452,61 @@ func (s *Store) writeLiveSettings(app AppType, provider Provider) error {
 		return s.writeGeminiLive(provider)
 	case AppGrok:
 		return s.writeGrokLive(provider)
+	case AppPi:
+		return s.writePiLive(provider)
 	case AppOpencode:
 		return s.writeOpencodeLive(provider)
 	default:
 		return fmt.Errorf("不支持的应用类型: %s", app)
 	}
+}
+
+func (s *Store) writePiLive(provider Provider) error {
+	settings := CloneMap(provider.SettingsConfig)
+	paths := []struct {
+		path string
+		key  string
+	}{
+		{s.piModelsPath(), "models"},
+		{s.piAuthPath(), "auth"},
+		{s.piSettingsPath(), "settings"},
+	}
+	for _, item := range paths {
+		doc := map[string]any{}
+		if content, err := os.ReadFile(item.path); err == nil && len(strings.TrimSpace(string(content))) > 0 {
+			if err := json.Unmarshal(content, &doc); err != nil {
+				return fmt.Errorf("解析 Pi 配置失败: %w", err)
+			}
+		} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("读取 Pi 配置失败: %w", err)
+		}
+		if source, ok := settings[item.key].(map[string]any); ok {
+			if item.key == "models" {
+				providers := getOrCreateMap(doc, "providers")
+				sourceProviders := getOrCreateMap(source, "providers")
+				key := piProviderKeyForProvider(provider)
+				if entry := directMapValue(sourceProviders, key); len(entry) > 0 {
+					providers[key] = entry
+				} else {
+					delete(providers, key)
+				}
+				doc["providers"] = providers
+			} else if item.key == "auth" {
+				key := piProviderKeyForProvider(provider)
+				if entry := directMapValue(source, key); len(entry) > 0 {
+					doc[key] = entry
+				} else {
+					delete(doc, key)
+				}
+			} else {
+				mergeMaps(doc, source)
+			}
+		}
+		if err := writeJSONAtomic(item.path, doc); err != nil {
+			return fmt.Errorf("写入 Pi 配置失败: %w", err)
+		}
+	}
+	return nil
 }
 
 func (s *Store) writeGrokLive(provider Provider) error {
@@ -1655,6 +1854,36 @@ func (s *Store) grokConfigPath() string {
 	return filepath.Join(s.configDirFor(AppGrok), "config.toml")
 }
 
+func (s *Store) piModelsPath() string {
+	return filepath.Join(s.configDirFor(AppPi), "models.json")
+}
+
+func (s *Store) piAuthPath() string {
+	return filepath.Join(s.configDirFor(AppPi), "auth.json")
+}
+
+func (s *Store) piSettingsPath() string {
+	return filepath.Join(s.configDirFor(AppPi), "settings.json")
+}
+
+func (s *Store) PiSessionDir() string {
+	if custom := strings.TrimSpace(os.Getenv("PI_CODING_AGENT_SESSION_DIR")); custom != "" {
+		return resolveOverridePath(custom)
+	}
+	if content, err := os.ReadFile(s.piSettingsPath()); err == nil {
+		var settings map[string]any
+		if json.Unmarshal(content, &settings) == nil {
+			if configured := strings.TrimSpace(stringValue(settings["sessionDir"])); configured != "" {
+				if filepath.IsAbs(configured) {
+					return configured
+				}
+				return filepath.Join(s.configDirFor(AppPi), configured)
+			}
+		}
+	}
+	return filepath.Join(s.configDirFor(AppPi), "sessions")
+}
+
 func (s *Store) opencodeConfigPath() string {
 	if custom := strings.TrimSpace(os.Getenv("OPENCODE_CONFIG")); custom != "" {
 		return resolveOverridePath(custom)
@@ -1725,6 +1954,8 @@ func (s *Store) liveFilesBytes(app AppType) ([]liveFileBytes, error) {
 		paths = []string{s.geminiEnvPath(), s.geminiSettingsPath()}
 	case AppGrok:
 		paths = []string{s.grokConfigPath()}
+	case AppPi:
+		paths = []string{s.piModelsPath(), s.piAuthPath(), s.piSettingsPath()}
 	case AppOpencode:
 		paths = []string{s.opencodeConfigPath()}
 	default:
@@ -1763,6 +1994,8 @@ func (s *Store) configDirFor(app AppType) string {
 		return filepath.Join(homeDir(), ".gemini")
 	case AppGrok:
 		return filepath.Join(homeDir(), ".grok")
+	case AppPi:
+		return filepath.Join(homeDir(), ".pi", "agent")
 	case AppOpencode:
 		if xdg := strings.TrimSpace(os.Getenv("XDG_CONFIG_HOME")); xdg != "" {
 			return filepath.Join(resolveOverridePath(xdg), "opencode")
@@ -1784,6 +2017,8 @@ func nativeConfigDir(app AppType) string {
 		envKey = "GEMINI_CLI_HOME"
 	case AppGrok:
 		envKey = "GROK_HOME"
+	case AppPi:
+		envKey = "PI_CODING_AGENT_DIR"
 	case AppOpencode:
 		envKey = "OPENCODE_CONFIG_DIR"
 	}
@@ -1850,6 +2085,8 @@ func currentProviderKey(app AppType) string {
 		return "currentProviderGemini"
 	case AppGrok:
 		return "currentProviderGrok"
+	case AppPi:
+		return "currentProviderPi"
 	default:
 		return ""
 	}
@@ -1865,6 +2102,8 @@ func configDirKey(app AppType) string {
 		return "geminiConfigDir"
 	case AppGrok:
 		return "grokConfigDir"
+	case AppPi:
+		return "piConfigDir"
 	case AppOpencode:
 		return "opencodeConfigDir"
 	default:

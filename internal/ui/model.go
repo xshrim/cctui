@@ -11,6 +11,7 @@ import (
 	"cctui/internal/ccswitch"
 	"cctui/internal/codex"
 	"cctui/internal/grok"
+	"cctui/internal/pi"
 )
 
 type screenMode int
@@ -210,6 +211,8 @@ func (m *Model) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.jumpToApp(ccswitch.AppGrok)
 		case "5":
 			m.jumpToApp(ccswitch.AppOpencode)
+		case "6":
+			m.jumpToApp(ccswitch.AppPi)
 		case "a":
 			row := m.selectedRow()
 			if row != nil {
@@ -446,6 +449,17 @@ func (m *Model) switchProvider(app ccswitch.AppType, provider ccswitch.Provider,
 	} else if restoreSession && app == ccswitch.AppGrok {
 		input := m.store.ExtractInput(app, provider)
 		report, err := grok.SwitchToModel(m.store.ConfigDir(ccswitch.AppGrok), input.Model)
+		if err != nil {
+			status += fmt.Sprintf("；会话恢复失败: %v", err)
+			statusKind = statusError
+		} else if report.Updated > 0 {
+			status += fmt.Sprintf("；已恢复 %d 个会话", report.Updated)
+		} else {
+			status += "；会话无需恢复"
+		}
+	} else if restoreSession && app == ccswitch.AppPi {
+		input := m.store.ExtractInput(app, provider)
+		report, err := pi.SwitchToModel(m.store.PiSessionDir(), provider.ID, input.Model)
 		if err != nil {
 			status += fmt.Sprintf("；会话恢复失败: %v", err)
 			statusKind = statusError
@@ -1064,7 +1078,7 @@ func (m *Model) renderHelpLines() []string {
 			help("a", "添加"),
 			help("e", "编辑"),
 			help("d", "删除"),
-			help("1/2/3/4/5", "跳应用"),
+			help("1/2/3/4/5/6", "跳应用"),
 			help("g/G", "顶/底"),
 			help("q", "退出"),
 		}
@@ -1073,7 +1087,7 @@ func (m *Model) renderHelpLines() []string {
 }
 
 func sessionRestoreEnabled(app ccswitch.AppType) bool {
-	return app == ccswitch.AppCodex || app == ccswitch.AppGrok
+	return app == ccswitch.AppCodex || app == ccswitch.AppGrok || app == ccswitch.AppPi
 }
 
 func newFormState(app ccswitch.AppType, provider *ccswitch.Provider, input ccswitch.ProviderInput) formState {
@@ -1280,6 +1294,8 @@ func placeholderFor(app ccswitch.AppType, label string) string {
 			return "e.g. gemini-2.5-pro"
 		case ccswitch.AppGrok:
 			return "e.g. grok-4.6"
+		case ccswitch.AppPi:
+			return "e.g. gpt-4o"
 		}
 	case "Reasoning Effort":
 		return "e.g. medium / high"
@@ -1316,6 +1332,8 @@ func providerBaseURLFallback(app ccswitch.AppType) string {
 	case ccswitch.AppGemini:
 		return "Google OAuth"
 	case ccswitch.AppGrok:
+		return "官方登录"
+	case ccswitch.AppPi:
 		return "官方登录"
 	default:
 		return "-"

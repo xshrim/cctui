@@ -151,6 +151,25 @@ func (s *Store) previewTargetFiles(app AppType, provider Provider) ([]previewFil
 			return nil, fmt.Errorf("生成 Grok 配置预览失败: %w", err)
 		}
 		return []previewFile{{path: s.grokConfigPath(), kind: previewText, data: data}}, nil
+	case AppPi:
+		settings := CloneMap(provider.SettingsConfig)
+		modelsData, err := marshalPreviewJSON(getOrCreateMap(settings, "models"))
+		if err != nil {
+			return nil, fmt.Errorf("生成 Pi models 配置预览失败: %w", err)
+		}
+		authData, err := marshalPreviewJSON(getOrCreateMap(settings, "auth"))
+		if err != nil {
+			return nil, fmt.Errorf("生成 Pi auth 配置预览失败: %w", err)
+		}
+		settingsData, err := marshalPreviewJSON(getOrCreateMap(settings, "settings"))
+		if err != nil {
+			return nil, fmt.Errorf("生成 Pi settings 配置预览失败: %w", err)
+		}
+		return []previewFile{
+			{path: s.piModelsPath(), kind: previewJSON, data: modelsData},
+			{path: s.piAuthPath(), kind: previewJSON, data: authData},
+			{path: s.piSettingsPath(), kind: previewJSON, data: settingsData},
+		}, nil
 	default:
 		return nil, fmt.Errorf("不支持的应用类型: %s", app)
 	}
@@ -290,6 +309,9 @@ func redactPreviewText(content string) string {
 
 func isSensitivePreviewKey(key string) bool {
 	compact := strings.NewReplacer("_", "", "-", "").Replace(strings.ToLower(key))
+	if compact == "key" {
+		return true
+	}
 	for _, marker := range []string{"apikey", "authtoken", "accesstoken", "refreshtoken", "clientsecret", "password", "secret"} {
 		if strings.Contains(compact, marker) {
 			return true

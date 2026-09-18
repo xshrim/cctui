@@ -65,6 +65,7 @@ type importDocument struct {
 	Codex     []ImportProvider `json:"codex,omitempty" yaml:"codex,omitempty"`
 	Gemini    []ImportProvider `json:"gemini,omitempty" yaml:"gemini,omitempty"`
 	Grok      []ImportProvider `json:"grok,omitempty" yaml:"grok,omitempty"`
+	Pi        []ImportProvider `json:"pi,omitempty" yaml:"pi,omitempty"`
 	Opencode  []ImportProvider `json:"opencode,omitempty" yaml:"opencode,omitempty"`
 }
 
@@ -254,6 +255,7 @@ func parseImportDocument(path string, data []byte) ([]ImportProvider, error) {
 	providers = appendGroupedImportProviders(providers, AppCodex, document.Codex)
 	providers = appendGroupedImportProviders(providers, AppGemini, document.Gemini)
 	providers = appendGroupedImportProviders(providers, AppGrok, document.Grok)
+	providers = appendGroupedImportProviders(providers, AppPi, document.Pi)
 	providers = appendGroupedImportProviders(providers, AppOpencode, document.Opencode)
 	return providers, nil
 }
