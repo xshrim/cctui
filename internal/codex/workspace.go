@@ -11,11 +11,12 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
-	"strconv"
 	"strings"
 	"time"
 
+	toml "github.com/pelletier/go-toml/v2"
 	_ "modernc.org/sqlite"
 )
 
@@ -107,7 +108,7 @@ func (w *Workspace) RecentThreads(limit int) ([]Thread, error) {
 			coalesce(source, ''),
 			coalesce(cli_version, '')
 		from threads
-		order by updated_at desc
+		order by coalesce(updated_at_ms, updated_at * 1000) desc
 		limit ?
 	`, limit)
 	if err != nil {
@@ -188,11 +189,7 @@ func (w *Workspace) CurrentModelProvider() (string, error) {
 		}
 		return "", err
 	}
-	provider := parseModelProvider(string(data))
-	if provider == "" {
-		return "openai", nil
-	}
-	return provider, nil
+	return parseCurrentModelProvider(string(data))
 }
 
 func (w *Workspace) ProviderMismatchThreads(provider string, includeArchived bool, limit int) ([]Thread, error) {
@@ -210,6 +207,7 @@ func (w *Workspace) ProviderMismatchThreads(provider string, includeArchived boo
 	where := []string{
 		"coalesce(model_provider, '') <> ?",
 		"coalesce(rollout_path, '') <> ''",
+		"coalesce(has_user_event, 0) = 1",
 	}
 	args := []any{provider}
 	if !includeArchived {
@@ -237,7 +235,7 @@ func (w *Workspace) ProviderMismatchThreads(provider string, includeArchived boo
 			coalesce(cli_version, '')
 		from threads
 		where `+strings.Join(where, " and ")+`
-		order by updated_at desc`+limitSQL,
+		order by coalesce(updated_at_ms, updated_at * 1000) desc`+limitSQL,
 		args...,
 	)
 	if err != nil {
@@ -295,6 +293,12 @@ func (w *Workspace) SearchTranscripts(keywords []string, limit int) ([]SearchRes
 		err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 			if err != nil {
 				return err
+			}
+			if d.Type()&os.ModeSymlink != 0 {
+				if d.IsDir() {
+					return filepath.SkipDir
+				}
+				return nil
 			}
 			if d.IsDir() || filepath.Ext(path) != ".jsonl" {
 				return nil
@@ -362,32 +366,12 @@ func (w *Workspace) RepairThreads(opts RepairOptions) (*RepairReport, error) {
 		SessionIndexPath: w.SessionIndexPath,
 	}
 	stamp := time.Now().UTC().Format("20060102_150405")
-
-	if err := w.backupOnce(w.DatabasePath, stamp, backupSet, report); err != nil {
-		return nil, err
-	}
-	if _, err := os.Stat(w.SessionIndexPath); err == nil {
-		if err := w.backupOnce(w.SessionIndexPath, stamp, backupSet, report); err != nil {
-			return nil, err
-		}
-	}
-
-	updatedThreads := make([]Thread, 0, len(targets))
-	tx, err := db.Begin()
-	if err != nil {
-		return nil, err
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback()
-		}
-	}()
-
+	rolloutPaths := make(map[string]string, len(targets))
 	for _, thread := range targets {
-		targetProvider := firstNonEmpty(opts.ModelProvider, thread.ModelProvider)
-		targetCWD := firstNonEmpty(opts.CWD, thread.CWD)
-		rolloutPath := normalizeRolloutPath(thread.RolloutPath)
+		rolloutPath, err := w.validateRolloutPath(thread.RolloutPath)
+		if err != nil {
+			return nil, fmt.Errorf("validate rollout %s: %w", thread.ID, err)
+		}
 		if rolloutPath == "" {
 			report.SkippedThreads = append(report.SkippedThreads, SkippedThread{
 				ID:     thread.ID,
@@ -408,8 +392,42 @@ func (w *Workspace) RepairThreads(opts RepairOptions) (*RepairReport, error) {
 			}
 			return nil, fmt.Errorf("stat rollout %s: %w", rolloutPath, err)
 		}
+		if err := validateRolloutIdentity(rolloutPath, thread.ID); err != nil {
+			return nil, fmt.Errorf("validate rollout %s: %w", thread.ID, err)
+		}
+		rolloutPaths[thread.ID] = rolloutPath
+	}
 
-		if err := w.backupOnce(rolloutPath, stamp, backupSet, report); err != nil {
+	if err := w.backupOnce(w.DatabasePath, stamp, backupSet, report, opts.DryRun); err != nil {
+		return nil, err
+	}
+	if _, err := os.Stat(w.SessionIndexPath); err == nil {
+		if err := w.backupOnce(w.SessionIndexPath, stamp, backupSet, report, opts.DryRun); err != nil {
+			return nil, err
+		}
+	}
+
+	updatedThreads := make([]Thread, 0, len(targets))
+	tx, err := db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+
+	for _, thread := range targets {
+		targetProvider := firstNonEmpty(opts.ModelProvider, thread.ModelProvider)
+		targetCWD := firstNonEmpty(opts.CWD, thread.CWD)
+		rolloutPath, ok := rolloutPaths[thread.ID]
+		if !ok {
+			continue
+		}
+
+		if err := w.backupOnce(rolloutPath, stamp, backupSet, report, opts.DryRun); err != nil {
 			return nil, err
 		}
 		changed, err := patchRolloutMetadata(rolloutPath, thread.ID, targetProvider, targetCWD, opts.DryRun)
@@ -422,9 +440,7 @@ func (w *Workspace) RepairThreads(opts RepairOptions) (*RepairReport, error) {
 				update threads
 				set
 					model_provider = ?,
-					cwd = ?,
-					has_user_event = 0,
-					archived = 0
+					cwd = ?
 				where id = ?
 			`, targetProvider, targetCWD, thread.ID); err != nil {
 				return nil, fmt.Errorf("update thread %s: %w", thread.ID, err)
@@ -433,8 +449,6 @@ func (w *Workspace) RepairThreads(opts RepairOptions) (*RepairReport, error) {
 
 		thread.ModelProvider = targetProvider
 		thread.CWD = targetCWD
-		thread.Archived = 0
-		thread.HasUserEvent = 0
 		thread.RolloutPath = rolloutPath
 		updatedThreads = append(updatedThreads, thread)
 
@@ -456,8 +470,12 @@ func (w *Workspace) RepairThreads(opts RepairOptions) (*RepairReport, error) {
 		if _, err := db.Exec(`pragma wal_checkpoint(full)`); err != nil {
 			return nil, fmt.Errorf("wal checkpoint: %w", err)
 		}
-		if _, err := db.Exec(`pragma integrity_check`); err != nil {
+		var integrity string
+		if err := db.QueryRow(`pragma integrity_check`).Scan(&integrity); err != nil {
 			return nil, fmt.Errorf("integrity check: %w", err)
+		}
+		if !strings.EqualFold(strings.TrimSpace(integrity), "ok") {
+			return nil, fmt.Errorf("integrity check: %s", integrity)
 		}
 	}
 
@@ -503,15 +521,15 @@ func (w *Workspace) SwitchToCurrentProvider(opts SwitchProviderOptions) (*Repair
 	})
 }
 
-func (w *Workspace) backupOnce(path, stamp string, seen map[string]struct{}, report *RepairReport) error {
+func (w *Workspace) backupOnce(path, stamp string, seen map[string]struct{}, report *RepairReport, dryRun bool) error {
 	if _, ok := seen[path]; ok {
 		return nil
 	}
 	seen[path] = struct{}{}
 
-	backupPath := path + ".bak.session-restore-" + stamp
+	backupPath := path + ".bak.session-restore-" + stamp + "-" + fmt.Sprintf("%d", time.Now().UnixNano())
 	report.BackupPaths = append(report.BackupPaths, backupPath)
-	if w.DryRun {
+	if dryRun {
 		return nil
 	}
 	if err := copyFile(path, backupPath); err != nil {
@@ -573,16 +591,15 @@ func patchRolloutMetadata(path, threadID, provider, cwd string, dryRun bool) (bo
 	}
 
 	reader := bufio.NewReader(file)
-	tempPath := path + ".tmp"
 	var tempFile *os.File
 	if !dryRun {
-		tempFile, err = os.Create(tempPath)
+		tempFile, err = os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-*")
 		if err != nil {
 			return false, err
 		}
 		defer func() {
 			_ = tempFile.Close()
-			_ = os.Remove(tempPath)
+			_ = os.Remove(tempFile.Name())
 		}()
 	}
 
@@ -623,9 +640,20 @@ func patchRolloutMetadata(path, threadID, provider, cwd string, dryRun bool) (bo
 	if dryRun {
 		return true, nil
 	}
+	if err := tempFile.Sync(); err != nil {
+		return false, err
+	}
+	currentInfo, err := os.Stat(path)
+	if err != nil {
+		return false, err
+	}
+	if currentInfo.Size() != info.Size() || !currentInfo.ModTime().Equal(info.ModTime()) {
+		return false, errors.New("rollout changed while it was being prepared")
+	}
 	if err := tempFile.Close(); err != nil {
 		return false, err
 	}
+	tempPath := tempFile.Name()
 	if err := os.Chmod(tempPath, info.Mode()); err != nil {
 		return false, err
 	}
@@ -652,7 +680,9 @@ func patchRolloutLine(line []byte, firstLine bool, threadID, provider, cwd strin
 	}
 
 	var document map[string]any
-	if err := json.Unmarshal(body, &document); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.UseNumber()
+	if err := decoder.Decode(&document); err != nil {
 		if firstLine {
 			return nil, false, fmt.Errorf("decode first line json: %w", err)
 		}
@@ -668,6 +698,9 @@ func patchRolloutLine(line []byte, firstLine bool, threadID, provider, cwd strin
 		payload, ok := document["payload"].(map[string]any)
 		if !ok {
 			return nil, false, fmt.Errorf("first line payload is missing or not an object")
+		}
+		if threadID != "" && stringValue(payload["id"]) != "" && stringValue(payload["id"]) != threadID {
+			return nil, false, fmt.Errorf("rollout thread id %q does not match database thread %q", stringValue(payload["id"]), threadID)
 		}
 		if threadID != "" && stringValue(payload["id"]) != threadID {
 			payload["id"] = threadID
@@ -724,9 +757,47 @@ func splitLineEnding(line []byte) ([]byte, []byte) {
 }
 
 type sessionIndexEntry struct {
-	ID         string `json:"id"`
-	ThreadName string `json:"thread_name"`
-	UpdatedAt  string `json:"updated_at"`
+	ID         string                     `json:"id"`
+	ThreadName string                     `json:"thread_name"`
+	UpdatedAt  string                     `json:"updated_at"`
+	Extra      map[string]json.RawMessage `json:"-"`
+}
+
+func (entry *sessionIndexEntry) UnmarshalJSON(data []byte) error {
+	type plain sessionIndexEntry
+	var decoded plain
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	delete(fields, "id")
+	delete(fields, "thread_name")
+	delete(fields, "updated_at")
+	*entry = sessionIndexEntry(decoded)
+	entry.Extra = fields
+	return nil
+}
+
+func (entry sessionIndexEntry) MarshalJSON() ([]byte, error) {
+	fields := make(map[string]json.RawMessage, len(entry.Extra)+3)
+	for key, value := range entry.Extra {
+		fields[key] = value
+	}
+	for key, value := range map[string]string{
+		"id":          entry.ID,
+		"thread_name": entry.ThreadName,
+		"updated_at":  entry.UpdatedAt,
+	} {
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			return nil, err
+		}
+		fields[key] = encoded
+	}
+	return json.Marshal(fields)
 }
 
 func (w *Workspace) updateSessionIndex(threads []Thread, dryRun bool) (bool, error) {
@@ -751,7 +822,7 @@ func (w *Workspace) updateSessionIndex(threads []Thread, dryRun bool) (bool, err
 			UpdatedAt:  threadUpdatedAtISO(thread),
 		}
 		if idx, ok := indexByID[thread.ID]; ok {
-			if entries[idx] != entry {
+			if !reflect.DeepEqual(entries[idx], entry) {
 				entries[idx] = entry
 				changed = true
 			}
@@ -778,7 +849,27 @@ func (w *Workspace) updateSessionIndex(threads []Thread, dryRun bool) (bool, err
 		builder.Write(line)
 		builder.WriteByte('\n')
 	}
-	if err := os.WriteFile(w.SessionIndexPath, []byte(builder.String()), 0o644); err != nil {
+	tempFile, err := os.CreateTemp(filepath.Dir(w.SessionIndexPath), "."+filepath.Base(w.SessionIndexPath)+".tmp-*")
+	if err != nil {
+		return false, err
+	}
+	tempPath := tempFile.Name()
+	defer os.Remove(tempPath)
+	if _, err := tempFile.WriteString(builder.String()); err != nil {
+		_ = tempFile.Close()
+		return false, err
+	}
+	if err := tempFile.Sync(); err != nil {
+		_ = tempFile.Close()
+		return false, err
+	}
+	if err := tempFile.Close(); err != nil {
+		return false, err
+	}
+	if err := os.Chmod(tempPath, 0o644); err != nil {
+		return false, err
+	}
+	if err := os.Rename(tempPath, w.SessionIndexPath); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -796,7 +887,7 @@ func readSessionIndexEntries(path string) ([]sessionIndexEntry, error) {
 	scanner := bufio.NewScanner(bytes.NewReader(data))
 	scanner.Buffer(make([]byte, 1024), 16*1024*1024)
 	entries := make([]sessionIndexEntry, 0)
-	seen := map[string]struct{}{}
+	seen := map[string]int{}
 
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -810,10 +901,11 @@ func readSessionIndexEntries(path string) ([]sessionIndexEntry, error) {
 		if entry.ID == "" {
 			continue
 		}
-		if _, ok := seen[entry.ID]; ok {
+		if index, ok := seen[entry.ID]; ok {
+			entries[index] = entry
 			continue
 		}
-		seen[entry.ID] = struct{}{}
+		seen[entry.ID] = len(entries)
 		entries = append(entries, entry)
 	}
 	return entries, scanner.Err()
@@ -897,69 +989,110 @@ func normalizeRolloutPath(path string) string {
 	return path
 }
 
-func parseModelProvider(config string) string {
-	section := ""
-	var profileProviders []string
-	for _, line := range strings.Split(config, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		if strings.HasPrefix(line, "[") && strings.Contains(line, "]") {
-			section = line
-			continue
-		}
-		key, value, ok := strings.Cut(line, "=")
-		if !ok || strings.TrimSpace(key) != "model_provider" {
-			continue
-		}
-		value = stripInlineComment(strings.TrimSpace(value))
-		provider := ""
-		if unquoted, err := strconv.Unquote(value); err == nil {
-			provider = strings.TrimSpace(unquoted)
-		} else {
-			provider = strings.Trim(value, `"' `)
-		}
-		if section == "" {
-			return provider
-		}
-		if strings.HasPrefix(section, "[profiles.") && provider != "" && !slices.Contains(profileProviders, provider) {
-			profileProviders = append(profileProviders, provider)
+func (w *Workspace) validateRolloutPath(raw string) (string, error) {
+	path := normalizeRolloutPath(raw)
+	if path == "" {
+		return "", nil
+	}
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(w.CodexDir, path)
+	}
+	cleanPath, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	cleanPath = filepath.Clean(cleanPath)
+	allowed := false
+	for _, rootName := range []string{"sessions", "archived_sessions"} {
+		root := filepath.Join(w.CodexDir, rootName)
+		rel, err := filepath.Rel(root, cleanPath)
+		if err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel) {
+			allowed = true
+			break
 		}
 	}
-	if len(profileProviders) == 1 {
-		return profileProviders[0]
+	if !allowed {
+		return "", fmt.Errorf("rollout path is outside Codex session directories")
 	}
-	return ""
+	info, err := os.Lstat(cleanPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return cleanPath, nil
+		}
+		return "", err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return "", fmt.Errorf("rollout path is not a regular file")
+	}
+	return cleanPath, nil
 }
 
-func stripInlineComment(value string) string {
-	inQuote := rune(0)
-	escaped := false
-	for i, char := range value {
-		if escaped {
-			escaped = false
+func validateRolloutIdentity(path, threadID string) error {
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	line, err := bufio.NewReader(file).ReadBytes('\n')
+	if err != nil && !errors.Is(err, io.EOF) {
+		return err
+	}
+	body, _ := splitLineEnding(line)
+	var document map[string]any
+	if err := json.Unmarshal(body, &document); err != nil {
+		return fmt.Errorf("decode rollout metadata: %w", err)
+	}
+	payload, ok := document["payload"].(map[string]any)
+	if !ok {
+		return errors.New("rollout metadata payload is missing")
+	}
+	actualID := stringValue(payload["id"])
+	if actualID != "" && threadID != "" && actualID != threadID {
+		return fmt.Errorf("rollout thread id %q does not match database thread %q", actualID, threadID)
+	}
+	return nil
+}
+
+func parseModelProvider(config string) string {
+	provider, _ := parseCurrentModelProvider(config)
+	return provider
+}
+
+func parseCurrentModelProvider(config string) (string, error) {
+	if strings.TrimSpace(config) == "" {
+		return "openai", nil
+	}
+
+	doc := map[string]any{}
+	if err := toml.Unmarshal([]byte(config), &doc); err != nil {
+		return "", fmt.Errorf("parse Codex config.toml: %w", err)
+	}
+	if provider := strings.TrimSpace(stringValue(doc["model_provider"])); provider != "" {
+		return provider, nil
+	}
+
+	profiles, ok := doc["profiles"].(map[string]any)
+	if !ok {
+		return "openai", nil
+	}
+	providers := make([]string, 0, len(profiles))
+	for _, rawProfile := range profiles {
+		profile, ok := rawProfile.(map[string]any)
+		if !ok {
 			continue
 		}
-		if char == '\\' && inQuote != 0 {
-			escaped = true
-			continue
-		}
-		if char == '\'' || char == '"' {
-			if inQuote == 0 {
-				inQuote = char
-				continue
-			}
-			if inQuote == char {
-				inQuote = 0
-			}
-			continue
-		}
-		if char == '#' && inQuote == 0 {
-			return strings.TrimSpace(value[:i])
+		provider := strings.TrimSpace(stringValue(profile["model_provider"]))
+		if provider != "" && !slices.Contains(providers, provider) {
+			providers = append(providers, provider)
 		}
 	}
-	return strings.TrimSpace(value)
+	if len(providers) == 1 {
+		return providers[0], nil
+	}
+	if len(providers) > 1 {
+		return "", errors.New("multiple Codex profile providers found; active provider is ambiguous")
+	}
+	return "openai", nil
 }
 
 func stringValue(value any) string {

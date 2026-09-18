@@ -171,6 +171,10 @@ func TestProviderMismatchThreadsIncludesOfficialSessions(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
+	sessionsDir := filepath.Join(dir, "sessions")
+	if err := os.MkdirAll(sessionsDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll() sessions error = %v", err)
+	}
 	dbPath := filepath.Join(dir, "state_5.sqlite")
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
@@ -246,7 +250,7 @@ func TestProviderMismatchThreadsIncludesOfficialSessions(t *testing.T) {
 		t.Fatalf("insert custom thread error = %v", err)
 	}
 
-	workspace := &Workspace{DatabasePath: dbPath}
+	workspace := &Workspace{CodexDir: dir, DatabasePath: dbPath}
 	threads, err := workspace.ProviderMismatchThreads("my_codex", false, 0)
 	if err != nil {
 		t.Fatalf("ProviderMismatchThreads() error = %v", err)
@@ -266,6 +270,10 @@ func TestRepairThreadsSkipsMissingRolloutAndContinues(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
+	sessionsDir := filepath.Join(dir, "sessions")
+	if err := os.MkdirAll(sessionsDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll() sessions error = %v", err)
+	}
 	dbPath := filepath.Join(dir, "state_5.sqlite")
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
@@ -310,8 +318,8 @@ func TestRepairThreadsSkipsMissingRolloutAndContinues(t *testing.T) {
 		t.Fatalf("create table error = %v", err)
 	}
 
-	validRollout := filepath.Join(dir, "valid.jsonl")
-	if err := os.WriteFile(validRollout, []byte(`{"type":"session_meta","payload":{"id":"valid","cwd":"/old","model_provider":"minimax"}}`+"\n"), 0o644); err != nil {
+	validRollout := filepath.Join(sessionsDir, "valid.jsonl")
+	if err := os.WriteFile(validRollout, []byte(`{"type":"session_meta","payload":{"id":"valid-thread","cwd":"/old","model_provider":"minimax"}}`+"\n"), 0o644); err != nil {
 		t.Fatalf("WriteFile() valid error = %v", err)
 	}
 
@@ -322,7 +330,7 @@ func TestRepairThreadsSkipsMissingRolloutAndContinues(t *testing.T) {
 			sandbox_policy, approval_mode, tokens_used, has_user_event, archived, cli_version,
 			first_user_message, memory_mode, created_at_ms, updated_at_ms, thread_source, preview
 		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, "missing-thread", filepath.Join(dir, "missing.jsonl"), now, now, "vscode", "minimax", dir, "Missing", "workspace-write", "accept", 0, 1, 0, "0.140.0-alpha.19", "", "enabled", now*1000, now*1000, "user", "")
+	`, "missing-thread", filepath.Join(sessionsDir, "missing.jsonl"), now, now, "vscode", "minimax", dir, "Missing", "workspace-write", "accept", 0, 1, 0, "0.140.0-alpha.19", "", "enabled", now*1000, now*1000, "user", "")
 	if err != nil {
 		t.Fatalf("insert missing thread error = %v", err)
 	}
@@ -337,7 +345,7 @@ func TestRepairThreadsSkipsMissingRolloutAndContinues(t *testing.T) {
 		t.Fatalf("insert valid thread error = %v", err)
 	}
 
-	workspace := &Workspace{DatabasePath: dbPath}
+	workspace := &Workspace{CodexDir: dir, DatabasePath: dbPath}
 	report, err := workspace.RepairThreads(RepairOptions{
 		ThreadIDs:     []string{"missing-thread", "valid-thread"},
 		ModelProvider: "openai",
@@ -357,5 +365,22 @@ func TestRepairThreadsSkipsMissingRolloutAndContinues(t *testing.T) {
 	}
 	if report.Threads[0].ID != "valid-thread" {
 		t.Fatalf("RepairedThreads[0].ID = %q, want valid-thread", report.Threads[0].ID)
+	}
+}
+
+func TestValidateRolloutPathRejectsOutsideSessionDirectory(t *testing.T) {
+	w := &Workspace{CodexDir: t.TempDir()}
+	if _, err := w.validateRolloutPath(filepath.Join(w.CodexDir, "outside.jsonl")); err == nil {
+		t.Fatal("validateRolloutPath() accepted a path outside session directories")
+	}
+}
+
+func TestValidateRolloutIdentityRejectsMismatchedThread(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "rollout.jsonl")
+	if err := os.WriteFile(path, []byte(`{"type":"session_meta","payload":{"id":"other"}}`+"\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	if err := validateRolloutIdentity(path, "expected"); err == nil {
+		t.Fatal("validateRolloutIdentity() accepted a mismatched thread")
 	}
 }

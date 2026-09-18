@@ -1,6 +1,7 @@
 package ccswitch
 
 import (
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -8,7 +9,6 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"slices"
 	"strings"
@@ -19,15 +19,17 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-var (
-	baseURLRe         = regexp.MustCompile(`(?m)base_url\s*=\s*["']([^"']+)["']`)
-	modelRe           = regexp.MustCompile(`(?m)^model\s*=\s*["']([^"']+)["']`)
-	reasoningEffortRe = regexp.MustCompile(`(?m)^model_reasoning_effort\s*=\s*["']([^"']+)["']`)
+const (
+	opencodeProviderKeyMeta = "opencodeProviderKey"
+	geminiAuthModeAPIKey    = "gemini-api-key"
+	geminiAuthModeOAuth     = "oauth-personal"
+	geminiAuthModeVertex    = "vertex-ai"
 )
 
 type Store struct {
 	db       *sql.DB
 	settings *settingsStore
+	liveHash map[AppType]string
 }
 
 type settingsStore struct {
@@ -51,13 +53,32 @@ func OpenStore() (*Store, error) {
 		return nil, fmt.Errorf("打开数据库失败: %w", err)
 	}
 
-	store := &Store{db: db, settings: settings}
+	store := &Store{db: db, settings: settings, liveHash: map[AppType]string{}}
 	if err := store.ensureSchema(); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if err := store.normalizeIncrementalState(); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
 
 	return store, nil
+}
+
+func (s *Store) normalizeIncrementalState() error {
+	if _, err := s.db.Exec(`UPDATE providers SET is_current = 0 WHERE app_type = ?`, AppOpencode.String()); err != nil {
+		return fmt.Errorf("清理 Opencode 当前状态失败: %w", err)
+	}
+	if s.settings != nil && s.settings.raw != nil {
+		if _, ok := s.settings.raw[""]; ok {
+			delete(s.settings.raw, "")
+			if err := s.settings.save(); err != nil {
+				return fmt.Errorf("清理 Opencode 当前配置失败: %w", err)
+			}
+		}
+	}
+	return nil
 }
 
 func (s *Store) Close() error {
@@ -73,6 +94,36 @@ func (s *Store) CodexConfigDir() string {
 	return s.configDirFor(AppCodex)
 }
 
+// ConfigDir returns the effective native configuration directory used by an
+// application. Native environment variables take precedence over cctui's
+// optional settings override because they control where the CLI actually
+// reads its configuration.
+func (s *Store) ConfigDir(app AppType) string {
+	return s.configDirFor(app)
+}
+
+// OpenCodeConfigPath returns the effective OpenCode config file, including an
+// OPENCODE_CONFIG file override when one is set.
+func (s *Store) OpenCodeConfigPath() string {
+	return s.opencodeConfigPath()
+}
+
+// ConfigPaths returns the live configuration files used by an application.
+func (s *Store) ConfigPaths(app AppType) []string {
+	switch app {
+	case AppClaude:
+		return []string{s.claudeSettingsPath()}
+	case AppCodex:
+		return []string{s.codexAuthPath(), s.codexConfigPath()}
+	case AppGemini:
+		return []string{s.geminiEnvPath(), s.geminiSettingsPath()}
+	case AppOpencode:
+		return []string{s.opencodeConfigPath()}
+	default:
+		return nil
+	}
+}
+
 func (s *Store) Bootstrap() ([]string, error) {
 	var warnings []string
 
@@ -82,6 +133,7 @@ func (s *Store) Bootstrap() ([]string, error) {
 			return warnings, err
 		}
 		if len(providers) > 0 {
+			_ = s.refreshLiveHash(app)
 			continue
 		}
 
@@ -93,6 +145,7 @@ func (s *Store) Bootstrap() ([]string, error) {
 		if imported {
 			warnings = append(warnings, fmt.Sprintf("已导入 %s 当前 live 配置", app.DisplayName()))
 		}
+		_ = s.refreshLiveHash(app)
 	}
 
 	return warnings, nil
@@ -105,6 +158,9 @@ func (s *Store) Snapshot() (*Snapshot, error) {
 	}
 
 	for _, app := range AllAppTypes {
+		if _, ok := s.liveHash[app]; !ok {
+			_ = s.refreshLiveHash(app)
+		}
 		providers, err := s.ListProviders(app)
 		if err != nil {
 			return nil, err
@@ -255,42 +311,60 @@ func (s *Store) AddProvider(app AppType, input ProviderInput) (*Provider, bool, 
 	}
 
 	id := uniqueProviderID(input.Name, providers, app)
+	if app == AppOpencode {
+		live, liveErr := s.readLiveSettings(app)
+		if liveErr != nil && !errors.Is(liveErr, os.ErrNotExist) {
+			return nil, false, liveErr
+		}
+		id = uniqueOpencodeProviderKey(input.Name, providers, live)
+	}
 	provider, err := s.buildProvider(app, nil, input, id)
 	if err != nil {
 		return nil, false, err
+	}
+	if app == AppOpencode {
+		if provider.Meta == nil {
+			provider.Meta = map[string]any{}
+		}
+		provider.Meta[opencodeProviderKeyMeta] = id
 	}
 
 	now := time.Now().UnixMilli()
 	sortIndex := nextSortIndex(providers)
 	provider.CreatedAt = &now
 	provider.SortIndex = &sortIndex
+	if app.IsIncremental() {
+		if err := s.checkLiveHash(app); err != nil {
+			return nil, false, err
+		}
+	}
 
 	if err := s.saveProviderRow(app, provider); err != nil {
 		return nil, false, err
 	}
 
 	autoSwitched := false
+	if app.IsIncremental() {
+		if err := s.writeLiveSettings(app, provider); err != nil {
+			return nil, false, err
+		}
+		_ = s.refreshLiveHash(app)
+		return &provider, false, nil
+	}
+
 	current, err := s.GetEffectiveCurrentProvider(app)
 	if err != nil {
 		return nil, false, err
 	}
 
-	// 增量模式：所有 provider 共存于同一配置文件，每次添加都要同步
-	if app.IsIncremental() {
+	if current == "" {
 		if err := s.writeLiveSettings(app, provider); err != nil {
 			return nil, false, err
-		}
-	}
-
-	if current == "" {
-		if !app.IsIncremental() {
-			if err := s.writeLiveSettings(app, provider); err != nil {
-				return nil, false, err
-			}
 		}
 		if err := s.setCurrentProvider(app, provider.ID); err != nil {
 			return nil, false, err
 		}
+		_ = s.refreshLiveHash(app)
 		autoSwitched = true
 	}
 
@@ -301,6 +375,17 @@ func (s *Store) UpdateProvider(app AppType, existing Provider, input ProviderInp
 	provider, err := s.buildProvider(app, &existing, input, existing.ID)
 	if err != nil {
 		return nil, err
+	}
+	if app.IsIncremental() {
+		if err := s.checkLiveHash(app); err != nil {
+			return nil, err
+		}
+	} else if current, err := s.GetEffectiveCurrentProvider(app); err != nil {
+		return nil, err
+	} else if current == existing.ID {
+		if err := s.checkLiveHash(app); err != nil {
+			return nil, err
+		}
 	}
 	provider.CreatedAt = existing.CreatedAt
 	provider.SortIndex = existing.SortIndex
@@ -318,6 +403,7 @@ func (s *Store) UpdateProvider(app AppType, existing Provider, input ProviderInp
 		if err := s.writeLiveSettings(app, provider); err != nil {
 			return nil, err
 		}
+		_ = s.refreshLiveHash(app)
 	} else {
 		current, err := s.GetEffectiveCurrentProvider(app)
 		if err != nil {
@@ -327,6 +413,7 @@ func (s *Store) UpdateProvider(app AppType, existing Provider, input ProviderInp
 			if err := s.writeLiveSettings(app, provider); err != nil {
 				return nil, err
 			}
+			_ = s.refreshLiveHash(app)
 		}
 	}
 
@@ -339,42 +426,61 @@ func (s *Store) DeleteProvider(app AppType, id string) error {
 		return err
 	}
 
-	current, err := s.GetEffectiveCurrentProvider(app)
-	if err != nil {
-		return err
-	}
-	if current == id {
-		if len(providers) > 1 {
+	current := ""
+	if !app.IsIncremental() {
+		current, err = s.GetEffectiveCurrentProvider(app)
+		if err != nil {
+			return err
+		}
+		if current == id && len(providers) > 1 {
 			return fmt.Errorf("不能删除当前正在使用的供应商，请先切换到其他供应商")
 		}
+	} else if err := s.checkLiveHash(app); err != nil {
+		return err
 	}
-
-	if _, err := s.db.Exec(`DELETE FROM providers WHERE id = ? AND app_type = ?`, id, app.String()); err != nil {
-		return fmt.Errorf("删除供应商失败: %w", err)
-	}
-
-	// 增量模式：从配置文件中移除对应的 provider 条目
+	opencodeKey := ""
 	if app.IsIncremental() {
-		for _, p := range providers {
-			if p.ID == id {
-				key := opencodeProviderKey(p.SettingsConfig, id)
-				s.removeOpencodeProviderEntry(key)
+		for _, provider := range providers {
+			if provider.ID == id {
+				opencodeKey = opencodeProviderKeyForProvider(provider)
 				break
 			}
 		}
+		if opencodeKey == "" {
+			return fmt.Errorf("供应商不存在或缺少 OpenCode provider key: %s", id)
+		}
+		if err := s.removeOpencodeProviderEntry(opencodeKey); err != nil {
+			return err
+		}
 	}
 
-	if current == id {
+	result, err := s.db.Exec(`DELETE FROM providers WHERE id = ? AND app_type = ?`, id, app.String())
+	if err != nil {
+		return fmt.Errorf("删除供应商失败: %w", err)
+	}
+	if affected, err := result.RowsAffected(); err != nil {
+		return fmt.Errorf("检查删除结果失败: %w", err)
+	} else if affected == 0 {
+		return fmt.Errorf("供应商不存在: %s", id)
+	}
+
+	if !app.IsIncremental() && current == id {
 		s.settings.setString(currentProviderKey(app), "")
 		if err := s.settings.save(); err != nil {
 			return err
 		}
+	}
+	if app.IsIncremental() {
+		_ = s.refreshLiveHash(app)
 	}
 
 	return nil
 }
 
 func (s *Store) SwitchProvider(app AppType, id string) error {
+	if app.IsIncremental() {
+		return fmt.Errorf("%s 为增量模式，不支持切换供应商", app.DisplayName())
+	}
 	target, err := s.GetProvider(app, id)
 	if err != nil {
 		return err
@@ -390,13 +496,25 @@ func (s *Store) SwitchProvider(app AppType, id string) error {
 	if current == id {
 		return nil
 	}
+	if err := s.checkLiveHash(app); err != nil {
+		return err
+	}
 
 	if current != "" {
-		if liveSettings, err := s.readLiveSettings(app); err == nil {
-			if existing, err := s.GetProvider(app, current); err == nil && existing != nil {
-				existing.SettingsConfig = liveSettings
-				_ = s.saveProviderRow(app, *existing)
-			}
+		liveSettings, err := s.readLiveSettings(app)
+		if err != nil {
+			return fmt.Errorf("读取当前 %s live 配置失败，已取消切换: %w", app.DisplayName(), err)
+		}
+		existing, err := s.GetProvider(app, current)
+		if err != nil {
+			return err
+		}
+		if existing == nil {
+			return fmt.Errorf("当前供应商不存在: %s", current)
+		}
+		existing.SettingsConfig = liveSettings
+		if err := s.saveProviderRow(app, *existing); err != nil {
+			return err
 		}
 	}
 
@@ -406,11 +524,16 @@ func (s *Store) SwitchProvider(app AppType, id string) error {
 	if err := s.setCurrentProvider(app, id); err != nil {
 		return err
 	}
+	_ = s.refreshLiveHash(app)
 
 	return nil
 }
 
 func (s *Store) GetEffectiveCurrentProvider(app AppType) (string, error) {
+	if app.IsIncremental() {
+		return "", nil
+	}
+
 	localKey := currentProviderKey(app)
 	if local := s.settings.getString(localKey); local != "" {
 		exists, err := s.providerExists(app, local)
@@ -452,9 +575,10 @@ func (s *Store) ExtractInput(app AppType, provider Provider) ProviderInput {
 		}
 
 		return ProviderInput{
-			Name:    provider.Name,
-			BaseURL: stringValue(env["ANTHROPIC_BASE_URL"]),
-			APIKey:  apiKey,
+			Name:              provider.Name,
+			BaseURL:           stringValue(env["ANTHROPIC_BASE_URL"]),
+			APIKey:            apiKey,
+			ClaudeAPIKeyField: stringValue(provider.Meta["apiKeyField"]),
 			Model: firstNonEmpty(
 				stringValue(env["ANTHROPIC_MODEL"]),
 				stringValue(env["ANTHROPIC_DEFAULT_SONNET_MODEL"]),
@@ -467,32 +591,30 @@ func (s *Store) ExtractInput(app AppType, provider Provider) ProviderInput {
 	case AppCodex:
 		auth := getOrCreateMap(provider.SettingsConfig, "auth")
 		configText := stringValue(provider.SettingsConfig["config"])
+		baseURL, model, reasoningEffort, _ := parseCodexConfigFields(configText)
 		return ProviderInput{
 			Name:            provider.Name,
-			BaseURL:         extractFirstMatch(baseURLRe, configText),
+			BaseURL:         baseURL,
 			APIKey:          stringValue(auth["OPENAI_API_KEY"]),
-			Model:           extractFirstMatch(modelRe, configText),
-			ReasoningEffort: extractFirstMatch(reasoningEffortRe, configText),
+			Model:           model,
+			ReasoningEffort: reasoningEffort,
 			Website:         deref(provider.WebsiteURL),
 			Notes:           deref(provider.Notes),
 		}
 	case AppGemini:
 		env := getOrCreateMap(provider.SettingsConfig, "env")
 		return ProviderInput{
-			Name:    provider.Name,
-			BaseURL: stringValue(env["GOOGLE_GEMINI_BASE_URL"]),
-			APIKey:  stringValue(env["GEMINI_API_KEY"]),
-			Model:   stringValue(env["GEMINI_MODEL"]),
-			Website: deref(provider.WebsiteURL),
-			Notes:   deref(provider.Notes),
+			Name:           provider.Name,
+			BaseURL:        stringValue(env["GOOGLE_GEMINI_BASE_URL"]),
+			APIKey:         stringValue(env["GEMINI_API_KEY"]),
+			GeminiAuthMode: stringValue(provider.Meta["geminiAuthMode"]),
+			Model:          stringValue(env["GEMINI_MODEL"]),
+			Website:        deref(provider.WebsiteURL),
+			Notes:          deref(provider.Notes),
 		}
 	case AppOpencode:
-		options, modelsMap := opencodeProviderConfig(provider.SettingsConfig, provider.ID)
-		firstModelName := ""
-		for name := range modelsMap {
-			firstModelName = name
-			break
-		}
+		options, modelsMap := opencodeProviderConfigForProvider(provider)
+		firstModelName := firstMapKey(modelsMap)
 		return ProviderInput{
 			Name:    provider.Name,
 			BaseURL: stringValue(options["baseURL"]),
@@ -517,7 +639,8 @@ func (s *Store) EndpointSummary(app AppType, provider Provider) string {
 		return summarizeURL(baseURL)
 	case AppCodex:
 		configText := stringValue(provider.SettingsConfig["config"])
-		baseURL := strings.TrimSpace(extractFirstMatch(baseURLRe, configText))
+		baseURL, _, _, _ := parseCodexConfigFields(configText)
+		baseURL = strings.TrimSpace(baseURL)
 		if baseURL == "" {
 			return "官方登录"
 		}
@@ -530,7 +653,7 @@ func (s *Store) EndpointSummary(app AppType, provider Provider) string {
 		}
 		return summarizeURL(baseURL)
 	case AppOpencode:
-		options, _ := opencodeProviderConfig(provider.SettingsConfig, provider.ID)
+		options, _ := opencodeProviderConfigForProvider(provider)
 		if baseURL := strings.TrimSpace(stringValue(options["baseURL"])); baseURL != "" {
 			return summarizeURL(baseURL)
 		}
@@ -587,6 +710,9 @@ func (s *Store) importCurrentLive(app AppType) (bool, error) {
 		}
 		return false, err
 	}
+	if app == AppOpencode {
+		return s.importOpencodeProviders(live)
+	}
 
 	id := uniqueProviderID("imported-"+app.DisplayName(), nil, app)
 	now := time.Now().UnixMilli()
@@ -599,6 +725,12 @@ func (s *Store) importCurrentLive(app AppType) (bool, error) {
 		SortIndex:      &sortIndex,
 		Meta:           map[string]any{},
 	}
+	if app == AppClaude {
+		provider.Meta["apiKeyField"] = detectClaudeAPIKeyField(live)
+	}
+	if app == AppGemini {
+		provider.Meta["geminiAuthMode"] = detectGeminiAuthMode(live)
+	}
 
 	if err := s.saveProviderRow(app, provider); err != nil {
 		return false, err
@@ -607,6 +739,40 @@ func (s *Store) importCurrentLive(app AppType) (bool, error) {
 		return false, err
 	}
 
+	return true, nil
+}
+
+func (s *Store) importOpencodeProviders(live map[string]any) (bool, error) {
+	providersMap, ok := live["provider"].(map[string]any)
+	if !ok || len(providersMap) == 0 {
+		return false, nil
+	}
+
+	keys := make([]string, 0, len(providersMap))
+	for key := range providersMap {
+		keys = append(keys, key)
+	}
+	slices.Sort(keys)
+	now := time.Now().UnixMilli()
+	for index, key := range keys {
+		name := key
+		if entry, ok := providersMap[key].(map[string]any); ok {
+			if configuredName := stringValue(entry["name"]); configuredName != "" {
+				name = configuredName
+			}
+		}
+		provider := Provider{
+			ID:             key,
+			Name:           name,
+			SettingsConfig: CloneMap(live),
+			CreatedAt:      &now,
+			SortIndex:      int64Ptr(int64(index)),
+			Meta:           map[string]any{opencodeProviderKeyMeta: key},
+		}
+		if err := s.saveProviderRow(AppOpencode, provider); err != nil {
+			return false, err
+		}
+	}
 	return true, nil
 }
 
@@ -637,8 +803,10 @@ func (s *Store) saveProviderRow(app AppType, provider Provider) error {
 		FROM providers
 		WHERE id = ? AND app_type = ?
 	`, provider.ID, app.String()).Scan(&existingCurrent, &existingInFailover)
-	if err == nil {
+	if err == nil && !app.IsIncremental() {
 		isCurrent = existingCurrent
+		provider.InFailoverQueue = existingInFailover
+	} else if err == nil {
 		provider.InFailoverQueue = existingInFailover
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("读取现有供应商状态失败: %w", err)
@@ -745,11 +913,14 @@ func (s *Store) buildProvider(app AppType, existing *Provider, input ProviderInp
 	case AppClaude:
 		settings := CloneMap(provider.SettingsConfig)
 		env := getOrCreateMap(settings, "env")
-		keyField := "ANTHROPIC_AUTH_TOKEN"
+		keyField := strings.TrimSpace(input.ClaudeAPIKeyField)
+		if keyField == "" && existing != nil {
+			keyField = stringValue(existing.Meta["apiKeyField"])
+		}
+		if keyField != "ANTHROPIC_AUTH_TOKEN" && keyField != "ANTHROPIC_API_KEY" {
+			keyField = "ANTHROPIC_API_KEY"
+		}
 		if existing != nil {
-			if stringValue(existing.Meta["apiKeyField"]) == "ANTHROPIC_API_KEY" {
-				keyField = "ANTHROPIC_API_KEY"
-			}
 			existingEnv := getOrCreateMap(existing.SettingsConfig, "env")
 			if stringValue(existingEnv["ANTHROPIC_API_KEY"]) != "" && stringValue(existingEnv["ANTHROPIC_AUTH_TOKEN"]) == "" {
 				keyField = "ANTHROPIC_API_KEY"
@@ -761,19 +932,26 @@ func (s *Store) buildProvider(app AppType, existing *Provider, input ProviderInp
 		if value := strings.TrimSpace(input.APIKey); value != "" {
 			env[keyField] = value
 		}
+		if provider.Meta == nil {
+			provider.Meta = map[string]any{}
+		}
+		provider.Meta["apiKeyField"] = keyField
 		patchStringField(env, "ANTHROPIC_BASE_URL", input.BaseURL)
 
 		model := strings.TrimSpace(input.Model)
-		if model == "" {
-			delete(env, "ANTHROPIC_MODEL")
-			delete(env, "ANTHROPIC_DEFAULT_HAIKU_MODEL")
-			delete(env, "ANTHROPIC_DEFAULT_SONNET_MODEL")
-			delete(env, "ANTHROPIC_DEFAULT_OPUS_MODEL")
+		if existing == nil {
+			patchStringField(env, "ANTHROPIC_MODEL", model)
 		} else {
-			env["ANTHROPIC_MODEL"] = model
-			env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = model
-			env["ANTHROPIC_DEFAULT_SONNET_MODEL"] = model
-			env["ANTHROPIC_DEFAULT_OPUS_MODEL"] = model
+			existingEnv := getOrCreateMap(existing.SettingsConfig, "env")
+			previousModel := firstNonEmpty(
+				stringValue(existingEnv["ANTHROPIC_MODEL"]),
+				stringValue(existingEnv["ANTHROPIC_DEFAULT_SONNET_MODEL"]),
+				stringValue(existingEnv["ANTHROPIC_DEFAULT_HAIKU_MODEL"]),
+				stringValue(existingEnv["ANTHROPIC_DEFAULT_OPUS_MODEL"]),
+			)
+			if model != previousModel {
+				patchStringField(env, "ANTHROPIC_MODEL", model)
+			}
 		}
 
 		settings["env"] = env
@@ -799,44 +977,84 @@ func (s *Store) buildProvider(app AppType, existing *Provider, input ProviderInp
 		patchStringField(env, "GEMINI_API_KEY", input.APIKey)
 		patchStringField(env, "GEMINI_MODEL", input.Model)
 		settings["env"] = env
+		authMode := strings.TrimSpace(input.GeminiAuthMode)
+		if authMode == "" {
+			authMode = stringValue(provider.Meta["geminiAuthMode"])
+		}
+		if authMode == "" {
+			authMode = detectGeminiAuthMode(settings)
+		}
+		if input.APIKey != "" {
+			authMode = geminiAuthModeAPIKey
+		} else if authMode != geminiAuthModeVertex {
+			authMode = geminiAuthModeOAuth
+		}
+		if provider.Meta == nil {
+			provider.Meta = map[string]any{}
+		}
+		provider.Meta["geminiAuthMode"] = authMode
 		provider.SettingsConfig = settings
 
 	case AppOpencode:
 		settings := CloneMap(provider.SettingsConfig)
-		modelName := strings.TrimSpace(input.Model)
-		if modelName == "" {
-			modelName = "default"
-		}
-
-		modelsValue := map[string]any{
-			modelName: map[string]any{"name": modelName},
-		}
-		optionsValue := map[string]any{"setCacheKey": true}
-		// 保留已有 options
-		existingOpts, _ := opencodeProviderConfig(settings, id)
-		for k, v := range existingOpts {
-			optionsValue[k] = v
-		}
-		patchStringField(optionsValue, "baseURL", input.BaseURL)
-		patchStringField(optionsValue, "apiKey", input.APIKey)
-
-		// 确定 provider key：优先复用现有 key，新建时用 slugify(name)
-		provKey := opencodeProviderKey(settings, id)
-		if provKey == id {
-			if s := slugify(input.Name); s != "" {
-				provKey = s
+		provKey := id
+		if existing != nil {
+			provKey = opencodeProviderKeyForProvider(*existing)
+			if provKey == "" {
+				return Provider{}, fmt.Errorf("无法确定 OpenCode provider key: %s", id)
 			}
 		}
 
 		provConfig := getOrCreateMap(settings, "provider")
-		provConfig[provKey] = map[string]any{
-			"models":  modelsValue,
-			"options": optionsValue,
+		entry, _ := provConfig[provKey].(map[string]any)
+		if entry == nil {
+			entry = map[string]any{}
+		} else {
+			entry = CloneMap(entry)
 		}
+
+		modelsValue, _ := entry["models"].(map[string]any)
+		if modelsValue == nil {
+			modelsValue = map[string]any{}
+		} else {
+			modelsValue = CloneMap(modelsValue)
+		}
+		modelName := strings.TrimSpace(input.Model)
+		if modelName != "" {
+			modelEntry, _ := modelsValue[modelName].(map[string]any)
+			if modelEntry == nil {
+				modelEntry = map[string]any{}
+			} else {
+				modelEntry = CloneMap(modelEntry)
+			}
+			modelEntry["name"] = modelName
+			modelsValue[modelName] = modelEntry
+		}
+		if len(modelsValue) == 0 {
+			modelName = "default"
+			modelsValue[modelName] = map[string]any{"name": modelName}
+		}
+
+		optionsValue, _ := entry["options"].(map[string]any)
+		if optionsValue == nil {
+			optionsValue = map[string]any{}
+		} else {
+			optionsValue = CloneMap(optionsValue)
+		}
+		if _, ok := optionsValue["setCacheKey"]; !ok {
+			optionsValue["setCacheKey"] = true
+		}
+		patchStringField(optionsValue, "baseURL", input.BaseURL)
+		patchStringField(optionsValue, "apiKey", input.APIKey)
+
+		entry["models"] = modelsValue
+		entry["options"] = optionsValue
+		provConfig[provKey] = entry
 		settings["provider"] = provConfig
-		// 只保留嵌套结构，不存 top-level 冗余字段
-		delete(settings, "models")
-		delete(settings, "options")
+		if provider.Meta == nil {
+			provider.Meta = map[string]any{}
+		}
+		provider.Meta[opencodeProviderKeyMeta] = provKey
 		provider.SettingsConfig = settings
 	}
 
@@ -941,7 +1159,7 @@ func (s *Store) readLiveSettings(app AppType) (map[string]any, error) {
 			return nil, fmt.Errorf("读取 Opencode 配置失败: %w", err)
 		}
 		var settings map[string]any
-		if err := json.Unmarshal(content, &settings); err != nil {
+		if err := unmarshalOpenCodeConfig(content, &settings); err != nil {
 			return nil, fmt.Errorf("解析 Opencode 配置失败: %w", err)
 		}
 		return settings, nil
@@ -984,7 +1202,9 @@ func (s *Store) writeGeminiLive(provider Provider) error {
 			return fmt.Errorf("读取 Gemini settings.json 失败: %w", err)
 		}
 		if len(strings.TrimSpace(string(content))) > 0 {
-			_ = json.Unmarshal(content, &configDoc)
+			if err := json.Unmarshal(content, &configDoc); err != nil {
+				return fmt.Errorf("解析 Gemini settings.json 失败: %w", err)
+			}
 		}
 	}
 	if rawConfig, ok := settings["config"]; ok {
@@ -997,9 +1217,9 @@ func (s *Store) writeGeminiLive(provider Provider) error {
 		}
 	}
 
-	selectedType := "gemini-api-key"
-	if len(envMap) == 0 {
-		selectedType = "oauth-personal"
+	selectedType := stringValue(provider.Meta["geminiAuthMode"])
+	if selectedType != geminiAuthModeAPIKey && selectedType != geminiAuthModeVertex && selectedType != geminiAuthModeOAuth {
+		selectedType = detectGeminiAuthMode(map[string]any{"env": env})
 	}
 	setNestedMapValue(configDoc, []string{"security", "auth", "selectedType"}, selectedType)
 
@@ -1014,24 +1234,38 @@ func (s *Store) writeGeminiLive(provider Provider) error {
 }
 
 // opencodeProviderKey 从 SettingsConfig 中解析 opencode.json 对应的 provider key。
-// 优先用 providerID 精确匹配，否则取第一个 key，最后 fallback 到 providerID 本身。
+// 只有精确匹配或唯一 provider 时才返回结果，避免随机选择 map 中的 key。
 func opencodeProviderKey(settings map[string]any, providerID string) string {
 	provConfigs, ok := settings["provider"].(map[string]any)
 	if !ok || len(provConfigs) == 0 {
-		return providerID
+		return ""
 	}
 	if _, found := provConfigs[providerID]; found {
 		return providerID
 	}
-	for k := range provConfigs {
-		return k
+	if len(provConfigs) == 1 {
+		for key := range provConfigs {
+			return key
+		}
 	}
-	return providerID
+	return ""
 }
 
 // opencodeProviderConfig 从 SettingsConfig 中提取指定 provider 的 options 和 models。
 func opencodeProviderConfig(settings map[string]any, providerID string) (options, models map[string]any) {
 	key := opencodeProviderKey(settings, providerID)
+	return opencodeProviderConfigByKey(settings, key)
+}
+
+func opencodeProviderConfigForProvider(provider Provider) (options, models map[string]any) {
+	key := opencodeProviderKeyForProvider(provider)
+	return opencodeProviderConfigByKey(provider.SettingsConfig, key)
+}
+
+func opencodeProviderConfigByKey(settings map[string]any, key string) (options, models map[string]any) {
+	if key == "" {
+		return map[string]any{}, map[string]any{}
+	}
 	if provConfigs, ok := settings["provider"].(map[string]any); ok {
 		if cfg, ok := provConfigs[key].(map[string]any); ok {
 			options, _ = cfg["options"].(map[string]any)
@@ -1041,7 +1275,57 @@ func opencodeProviderConfig(settings map[string]any, providerID string) (options
 	if options == nil {
 		options = map[string]any{}
 	}
+	if models == nil {
+		models = map[string]any{}
+	}
 	return
+}
+
+func opencodeProviderKeyForProvider(provider Provider) string {
+	if key := stringValue(provider.Meta[opencodeProviderKeyMeta]); key != "" {
+		return key
+	}
+	return opencodeProviderKey(provider.SettingsConfig, provider.ID)
+}
+
+func uniqueOpencodeProviderKey(name string, providers []Provider, live map[string]any) string {
+	base := slugify(name)
+	if base == "" {
+		base = "provider"
+	}
+	used := map[string]struct{}{}
+	for _, provider := range providers {
+		used[provider.ID] = struct{}{}
+		if key := opencodeProviderKeyForProvider(provider); key != "" {
+			used[key] = struct{}{}
+		}
+	}
+	if providerMap, ok := live["provider"].(map[string]any); ok {
+		for key := range providerMap {
+			used[key] = struct{}{}
+		}
+	}
+	if _, exists := used[base]; !exists {
+		return base
+	}
+	for index := 2; ; index++ {
+		candidate := fmt.Sprintf("%s-%d", base, index)
+		if _, exists := used[candidate]; !exists {
+			return candidate
+		}
+	}
+}
+
+func firstMapKey(values map[string]any) string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	if len(keys) == 0 {
+		return ""
+	}
+	slices.Sort(keys)
+	return keys[0]
 }
 
 func (s *Store) writeOpencodeLive(provider Provider) error {
@@ -1051,7 +1335,14 @@ func (s *Store) writeOpencodeLive(provider Provider) error {
 	// 读取现有文件，保留其他 provider 和 $schema
 	doc := map[string]any{}
 	if content, err := os.ReadFile(path); err == nil {
-		_ = json.Unmarshal(content, &doc)
+		if err := unmarshalOpenCodeConfig(content, &doc); err != nil {
+			return fmt.Errorf("解析 Opencode 配置失败: %w", err)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("读取 Opencode 配置失败: %w", err)
+	}
+	if doc == nil {
+		doc = map[string]any{}
 	}
 	if schema, ok := settings["$schema"]; ok {
 		doc["$schema"] = schema
@@ -1059,34 +1350,141 @@ func (s *Store) writeOpencodeLive(provider Provider) error {
 
 	// 合并当前 provider 条目到文件
 	docProviders := getOrCreateMap(doc, "provider")
-	key := opencodeProviderKey(settings, provider.ID)
+	key := opencodeProviderKeyForProvider(provider)
+	if key == "" {
+		return fmt.Errorf("无法确定 OpenCode provider key: %s", provider.ID)
+	}
 	if srcProviders, ok := settings["provider"].(map[string]any); ok {
 		if entry, ok := srcProviders[key]; ok {
 			docProviders[key] = entry
+		} else {
+			return fmt.Errorf("OpenCode 配置缺少 provider 条目: %s", key)
 		}
+	} else {
+		return fmt.Errorf("OpenCode 配置缺少 provider 表")
 	}
 	doc["provider"] = docProviders
 
 	return writeJSONAtomic(path, doc)
 }
 
-func (s *Store) removeOpencodeProviderEntry(providerID string) {
+func (s *Store) removeOpencodeProviderEntry(providerID string) error {
 	path := s.opencodeConfigPath()
 	content, err := os.ReadFile(path)
 	if err != nil {
-		return
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("读取 Opencode 配置失败: %w", err)
 	}
 	var doc map[string]any
-	if err := json.Unmarshal(content, &doc); err != nil {
-		return
+	if err := unmarshalOpenCodeConfig(content, &doc); err != nil {
+		return fmt.Errorf("解析 Opencode 配置失败: %w", err)
 	}
 	providers, ok := doc["provider"].(map[string]any)
 	if !ok {
-		return
+		return nil
 	}
 	delete(providers, providerID)
 	doc["provider"] = providers
-	_ = writeJSONAtomic(path, doc)
+	if err := writeJSONAtomic(path, doc); err != nil {
+		return fmt.Errorf("写入 Opencode 配置失败: %w", err)
+	}
+	return nil
+}
+
+func unmarshalOpenCodeConfig(data []byte, target *map[string]any) error {
+	if err := json.Unmarshal(data, target); err == nil {
+		return nil
+	}
+	return json.Unmarshal([]byte(stripJSONC(string(data))), target)
+}
+
+func stripJSONC(input string) string {
+	var withoutComments strings.Builder
+	inString := false
+	escaped := false
+	inLineComment := false
+	inBlockComment := false
+	for index := 0; index < len(input); index++ {
+		char := input[index]
+		if inLineComment {
+			if char == '\n' {
+				inLineComment = false
+				withoutComments.WriteByte(char)
+			}
+			continue
+		}
+		if inBlockComment {
+			if char == '*' && index+1 < len(input) && input[index+1] == '/' {
+				inBlockComment = false
+				index++
+			}
+			continue
+		}
+		if inString {
+			withoutComments.WriteByte(char)
+			if escaped {
+				escaped = false
+			} else if char == '\\' {
+				escaped = true
+			} else if char == '"' {
+				inString = false
+			}
+			continue
+		}
+		if char == '"' {
+			inString = true
+			withoutComments.WriteByte(char)
+			continue
+		}
+		if char == '/' && index+1 < len(input) && input[index+1] == '/' {
+			inLineComment = true
+			index++
+			continue
+		}
+		if char == '/' && index+1 < len(input) && input[index+1] == '*' {
+			inBlockComment = true
+			index++
+			continue
+		}
+		withoutComments.WriteByte(char)
+	}
+
+	text := withoutComments.String()
+	var result strings.Builder
+	inString = false
+	escaped = false
+	for index := 0; index < len(text); index++ {
+		char := text[index]
+		if inString {
+			result.WriteByte(char)
+			if escaped {
+				escaped = false
+			} else if char == '\\' {
+				escaped = true
+			} else if char == '"' {
+				inString = false
+			}
+			continue
+		}
+		if char == '"' {
+			inString = true
+			result.WriteByte(char)
+			continue
+		}
+		if char == ',' {
+			next := index + 1
+			for next < len(text) && strings.ContainsRune(" \t\r\n", rune(text[next])) {
+				next++
+			}
+			if next < len(text) && (text[next] == '}' || text[next] == ']') {
+				continue
+			}
+		}
+		result.WriteByte(char)
+	}
+	return result.String()
 }
 
 func (s *Store) claudeSettingsPath() string {
@@ -1119,10 +1517,97 @@ func (s *Store) geminiSettingsPath() string {
 }
 
 func (s *Store) opencodeConfigPath() string {
-	return filepath.Join(s.configDirFor(AppOpencode), "opencode.json")
+	if custom := strings.TrimSpace(os.Getenv("OPENCODE_CONFIG")); custom != "" {
+		return resolveOverridePath(custom)
+	}
+	dir := s.configDirFor(AppOpencode)
+	jsonPath := filepath.Join(dir, "opencode.json")
+	if fileExists(jsonPath) {
+		return jsonPath
+	}
+	jsoncPath := filepath.Join(dir, "opencode.jsonc")
+	if fileExists(jsoncPath) {
+		return jsoncPath
+	}
+	return jsonPath
+}
+
+func (s *Store) refreshLiveHash(app AppType) error {
+	if s.liveHash == nil {
+		s.liveHash = map[AppType]string{}
+	}
+	data, err := s.liveFilesBytes(app)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			s.liveHash[app] = "missing"
+			return nil
+		}
+		return err
+	}
+	hash := sha256.New()
+	for _, item := range data {
+		_, _ = hash.Write([]byte(item.path))
+		_, _ = hash.Write([]byte{0})
+		_, _ = hash.Write(item.data)
+		_, _ = hash.Write([]byte{0})
+	}
+	s.liveHash[app] = fmt.Sprintf("%x", hash.Sum(nil))
+	return nil
+}
+
+func (s *Store) checkLiveHash(app AppType) error {
+	if _, ok := s.liveHash[app]; !ok {
+		return s.refreshLiveHash(app)
+	}
+	previous := s.liveHash[app]
+	if err := s.refreshLiveHash(app); err != nil {
+		return fmt.Errorf("检查 %s live 配置失败: %w", app.DisplayName(), err)
+	}
+	if previous != s.liveHash[app] {
+		s.liveHash[app] = previous
+		return fmt.Errorf("%s live 配置在 cctui 外部发生变化，请重新加载后再切换", app.DisplayName())
+	}
+	return nil
+}
+
+type liveFileBytes struct {
+	path string
+	data []byte
+}
+
+func (s *Store) liveFilesBytes(app AppType) ([]liveFileBytes, error) {
+	paths := []string{}
+	switch app {
+	case AppClaude:
+		paths = []string{s.claudeSettingsPath()}
+	case AppCodex:
+		paths = []string{s.codexAuthPath(), s.codexConfigPath()}
+	case AppGemini:
+		paths = []string{s.geminiEnvPath(), s.geminiSettingsPath()}
+	case AppOpencode:
+		paths = []string{s.opencodeConfigPath()}
+	default:
+		return nil, fmt.Errorf("不支持的应用类型: %s", app)
+	}
+	result := make([]liveFileBytes, 0, len(paths))
+	for _, path := range paths {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				result = append(result, liveFileBytes{path: path, data: []byte("<missing>")})
+				continue
+			}
+			return nil, err
+		}
+		result = append(result, liveFileBytes{path: path, data: data})
+	}
+	return result, nil
 }
 
 func (s *Store) configDirFor(app AppType) string {
+	if native := nativeConfigDir(app); native != "" {
+		return native
+	}
 	key := configDirKey(app)
 	if custom := strings.TrimSpace(s.settings.getString(key)); custom != "" {
 		return resolveOverridePath(custom)
@@ -1136,10 +1621,31 @@ func (s *Store) configDirFor(app AppType) string {
 	case AppGemini:
 		return filepath.Join(homeDir(), ".gemini")
 	case AppOpencode:
+		if xdg := strings.TrimSpace(os.Getenv("XDG_CONFIG_HOME")); xdg != "" {
+			return filepath.Join(resolveOverridePath(xdg), "opencode")
+		}
 		return filepath.Join(homeDir(), ".config", "opencode")
 	default:
 		return homeDir()
 	}
+}
+
+func nativeConfigDir(app AppType) string {
+	var envKey string
+	switch app {
+	case AppClaude:
+		envKey = "CLAUDE_CONFIG_DIR"
+	case AppCodex:
+		envKey = "CODEX_HOME"
+	case AppGemini:
+		envKey = "GEMINI_CLI_HOME"
+	case AppOpencode:
+		envKey = "OPENCODE_CONFIG_DIR"
+	}
+	if envKey == "" {
+		return ""
+	}
+	return resolveOverridePath(os.Getenv(envKey))
 }
 
 func loadSettingsStore(path string) (*settingsStore, error) {
@@ -1217,6 +1723,36 @@ func configDirKey(app AppType) string {
 	}
 }
 
+func parseCodexConfigFields(config string) (baseURL, model, reasoningEffort string, err error) {
+	if strings.TrimSpace(config) == "" {
+		return "", "", "", nil
+	}
+	doc := map[string]any{}
+	if err := toml.Unmarshal([]byte(config), &doc); err != nil {
+		return "", "", "", err
+	}
+	model = stringValue(doc["model"])
+	reasoningEffort = stringValue(doc["model_reasoning_effort"])
+	providerKey := strings.TrimSpace(stringValue(doc["model_provider"]))
+	if providerKey != "" {
+		if providers, ok := doc["model_providers"].(map[string]any); ok {
+			if provider, ok := providers[providerKey].(map[string]any); ok {
+				baseURL = firstNonEmpty(
+					stringValue(provider["base_url"]),
+					stringValue(provider["openai_base_url"]),
+				)
+			}
+		}
+	}
+	if baseURL == "" {
+		baseURL = firstNonEmpty(
+			stringValue(doc["base_url"]),
+			stringValue(doc["openai_base_url"]),
+		)
+	}
+	return strings.TrimSpace(baseURL), strings.TrimSpace(model), strings.TrimSpace(reasoningEffort), nil
+}
+
 func patchCodexConfig(existing string, input ProviderInput) (string, error) {
 	trimmed := strings.TrimSpace(existing)
 	if trimmed == "" {
@@ -1233,7 +1769,6 @@ func patchCodexConfig(existing string, input ProviderInput) (string, error) {
 		}
 		if strings.TrimSpace(input.BaseURL) != "" {
 			doc["model_provider"] = "custom"
-			doc["disable_response_storage"] = true
 			doc["model_providers"] = map[string]any{
 				"custom": map[string]any{
 					"name":                 "custom",
@@ -1248,7 +1783,7 @@ func patchCodexConfig(existing string, input ProviderInput) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("生成 Codex config.toml 失败: %w", err)
 		}
-		return strings.TrimSpace(string(buf)), nil
+		return strings.TrimSpace(removeEmptyModelProvidersSection(string(buf))), nil
 	}
 
 	doc := map[string]any{}
@@ -1258,6 +1793,9 @@ func patchCodexConfig(existing string, input ProviderInput) (string, error) {
 
 	patchGenericMapString(doc, "model", input.Model)
 	patchGenericMapString(doc, "model_reasoning_effort", input.ReasoningEffort)
+	// cctui must not disable Codex response storage. In addition to being an
+	// unexpected side effect, that setting prevents Codex session recovery.
+	delete(doc, "disable_response_storage")
 
 	if providerKey, ok := doc["model_provider"].(string); ok && strings.TrimSpace(providerKey) != "" {
 		modelProviders, ok := doc["model_providers"].(map[string]any)
@@ -1270,7 +1808,11 @@ func patchCodexConfig(existing string, input ProviderInput) (string, error) {
 			providerTable = map[string]any{}
 			modelProviders[providerKey] = providerTable
 		}
-		patchGenericMapString(providerTable, "base_url", input.BaseURL)
+		baseURLKey := "base_url"
+		if _, exists := providerTable["openai_base_url"]; exists {
+			baseURLKey = "openai_base_url"
+		}
+		patchGenericMapString(providerTable, baseURLKey, input.BaseURL)
 		if strings.TrimSpace(input.BaseURL) != "" {
 			if _, ok := providerTable["name"]; !ok {
 				providerTable["name"] = providerKey
@@ -1283,7 +1825,11 @@ func patchCodexConfig(existing string, input ProviderInput) (string, error) {
 			}
 		}
 	} else {
-		patchGenericMapString(doc, "base_url", input.BaseURL)
+		baseURLKey := "base_url"
+		if _, exists := doc["openai_base_url"]; exists {
+			baseURLKey = "openai_base_url"
+		}
+		patchGenericMapString(doc, baseURLKey, input.BaseURL)
 	}
 
 	buf, err := toml.Marshal(doc)
@@ -1291,7 +1837,19 @@ func patchCodexConfig(existing string, input ProviderInput) (string, error) {
 		return "", fmt.Errorf("写回 Codex config.toml 失败: %w", err)
 	}
 
-	return strings.TrimSpace(string(buf)), nil
+	return strings.TrimSpace(removeEmptyModelProvidersSection(string(buf))), nil
+}
+
+func removeEmptyModelProvidersSection(config string) string {
+	lines := strings.Split(config, "\n")
+	filtered := make([]string, 0, len(lines))
+	for _, line := range lines {
+		if strings.TrimSpace(line) == "[model_providers]" {
+			continue
+		}
+		filtered = append(filtered, line)
+	}
+	return strings.Join(filtered, "\n")
 }
 
 func parseEnvFile(content string) map[string]string {
@@ -1329,6 +1887,55 @@ func serializeEnvFile(env map[string]string) string {
 		lines = append(lines, fmt.Sprintf("%s=%s", key, env[key]))
 	}
 	return strings.Join(lines, "\n")
+}
+
+func detectClaudeAPIKeyField(settings map[string]any) string {
+	env := getOrCreateMap(settings, "env")
+	if stringValue(env["ANTHROPIC_AUTH_TOKEN"]) != "" {
+		return "ANTHROPIC_AUTH_TOKEN"
+	}
+	return "ANTHROPIC_API_KEY"
+}
+
+func detectGeminiAuthMode(settings map[string]any) string {
+	env := getOrCreateMap(settings, "env")
+	if stringValue(env["GEMINI_API_KEY"]) != "" {
+		return geminiAuthModeAPIKey
+	}
+	if strings.EqualFold(stringValue(env["GOOGLE_GENAI_USE_VERTEXAI"]), "true") ||
+		stringValue(env["GOOGLE_API_KEY"]) != "" ||
+		stringValue(env["GOOGLE_CLOUD_PROJECT"]) != "" ||
+		stringValue(env["GOOGLE_CLOUD_PROJECT_ID"]) != "" {
+		return geminiAuthModeVertex
+	}
+	if config, ok := settings["config"].(map[string]any); ok {
+		if selected := nestedStringValue(config, []string{"security", "auth", "selectedType"}); selected != "" {
+			switch selected {
+			case geminiAuthModeAPIKey, geminiAuthModeVertex, geminiAuthModeOAuth:
+				return selected
+			}
+		}
+	}
+	return geminiAuthModeOAuth
+}
+
+func nestedStringValue(value map[string]any, path []string) string {
+	current := value
+	for index, key := range path {
+		item, ok := current[key]
+		if !ok {
+			return ""
+		}
+		if index == len(path)-1 {
+			return stringValue(item)
+		}
+		next, ok := item.(map[string]any)
+		if !ok {
+			return ""
+		}
+		current = next
+	}
+	return ""
 }
 
 func writeCodexLiveAtomic(authPath, configPath string, auth map[string]any, config string) error {
@@ -1504,14 +2111,6 @@ func setNestedMapValue(target map[string]any, path []string, value any) {
 	current[path[len(path)-1]] = value
 }
 
-func extractFirstMatch(re *regexp.Regexp, input string) string {
-	match := re.FindStringSubmatch(input)
-	if len(match) > 1 {
-		return match[1]
-	}
-	return ""
-}
-
 func summarizeURL(raw string) string {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -1582,6 +2181,10 @@ func stringPtrOrNil(value string) *string {
 		return nil
 	}
 	return &trimmed
+}
+
+func int64Ptr(value int64) *int64 {
+	return &value
 }
 
 func deref(value *string) string {

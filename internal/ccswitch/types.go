@@ -59,17 +59,42 @@ func (p Provider) Clone() Provider {
 	clone := p
 	clone.SettingsConfig = CloneMap(p.SettingsConfig)
 	clone.Meta = CloneMap(p.Meta)
+	clone.WebsiteURL = cloneStringPtr(p.WebsiteURL)
+	clone.Category = cloneStringPtr(p.Category)
+	clone.CreatedAt = cloneInt64Ptr(p.CreatedAt)
+	clone.SortIndex = cloneInt64Ptr(p.SortIndex)
+	clone.Notes = cloneStringPtr(p.Notes)
+	clone.Icon = cloneStringPtr(p.Icon)
+	clone.IconColor = cloneStringPtr(p.IconColor)
 	return clone
 }
 
+func cloneStringPtr(value *string) *string {
+	if value == nil {
+		return nil
+	}
+	clone := *value
+	return &clone
+}
+
+func cloneInt64Ptr(value *int64) *int64 {
+	if value == nil {
+		return nil
+	}
+	clone := *value
+	return &clone
+}
+
 type ProviderInput struct {
-	Name            string
-	BaseURL         string
-	APIKey          string
-	Model           string
-	ReasoningEffort string
-	Website         string
-	Notes           string
+	Name              string
+	BaseURL           string
+	APIKey            string
+	ClaudeAPIKeyField string
+	GeminiAuthMode    string
+	Model             string
+	ReasoningEffort   string
+	Website           string
+	Notes             string
 }
 
 type Snapshot struct {

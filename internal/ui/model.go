@@ -64,6 +64,8 @@ type switchConfirmState struct {
 	app            ccswitch.AppType
 	provider       ccswitch.Provider
 	restoreSession bool
+	preview        *ccswitch.SwitchPreview
+	diffOffset     int
 }
 
 type Model struct {
@@ -110,6 +112,10 @@ var (
 	formHintStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
 	panelTitleStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("212")).Bold(true)
 	dangerStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("203")).Bold(true)
+	diffAddStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
+	diffRemoveStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
+	diffHeaderStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("81")).Bold(true)
+	diffContextStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
 	selectedAddStyle = lipgloss.NewStyle().
 				Foreground(lipgloss.Color("230")).
 				Background(lipgloss.Color("63")).
@@ -241,16 +247,19 @@ func (m *Model) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.setStatus(fmt.Sprintf("%s 已经是当前供应商", row.provider.Name), statusInfo)
 					return m, nil
 				}
-				if row.app == ccswitch.AppCodex {
-					m.switchConfirm = &switchConfirmState{
-						app:            row.app,
-						provider:       *row.provider,
-						restoreSession: true,
-					}
-					m.mode = modeSwitchConfirm
+				preview, err := m.store.PreviewSwitch(row.app, row.provider.ID)
+				if err != nil {
+					m.setStatus(fmt.Sprintf("切换预览失败: %v", err), statusError)
 					return m, nil
 				}
-				return m.switchProvider(row.app, *row.provider, false)
+				m.switchConfirm = &switchConfirmState{
+					app:            row.app,
+					provider:       *row.provider,
+					restoreSession: row.app == ccswitch.AppCodex,
+					preview:        preview,
+				}
+				m.mode = modeSwitchConfirm
+				return m, nil
 			}
 		}
 	}
@@ -357,10 +366,38 @@ func (m *Model) updateSwitchConfirm(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.switchConfirm = nil
 		m.setStatus("已取消切换", statusInfo)
 		return m, nil
+	case "up", "k":
+		if m.switchConfirm.diffOffset > 0 {
+			m.switchConfirm.diffOffset--
+		}
+		return m, nil
+	case "down", "j":
+		m.switchConfirm.diffOffset++
+		return m, nil
+	case "pgup", "ctrl+u":
+		m.switchConfirm.diffOffset -= 8
+		if m.switchConfirm.diffOffset < 0 {
+			m.switchConfirm.diffOffset = 0
+		}
+		return m, nil
+	case "pgdown", "ctrl+d":
+		m.switchConfirm.diffOffset += 8
+		return m, nil
+	case "home":
+		m.switchConfirm.diffOffset = 0
+		return m, nil
 	case "r", "space", " ":
-		m.switchConfirm.restoreSession = !m.switchConfirm.restoreSession
+		if m.switchConfirm.app == ccswitch.AppCodex {
+			m.switchConfirm.restoreSession = !m.switchConfirm.restoreSession
+		}
 		return m, nil
 	case "n":
+		if m.switchConfirm.app != ccswitch.AppCodex {
+			m.mode = modeList
+			m.switchConfirm = nil
+			m.setStatus("已取消切换", statusInfo)
+			return m, nil
+		}
 		state := *m.switchConfirm
 		m.mode = modeList
 		m.switchConfirm = nil
@@ -604,6 +641,20 @@ func (m *Model) setStatus(message string, kind statusLevel) {
 	m.statusKind = kind
 }
 
+func renderDiffLine(line string, width int) string {
+	line = truncate(line, width)
+	switch {
+	case strings.HasPrefix(line, "--- "), strings.HasPrefix(line, "+++ "):
+		return diffHeaderStyle.Render(line)
+	case strings.HasPrefix(line, "+ "):
+		return diffAddStyle.Render(line)
+	case strings.HasPrefix(line, "- "):
+		return diffRemoveStyle.Render(line)
+	default:
+		return diffContextStyle.Render(line)
+	}
+}
+
 func (m *Model) viewList() string {
 	helpLines := m.renderHelpLines()
 	statusLines := strings.Split(m.renderStatusLine(), "\n")
@@ -746,6 +797,13 @@ func (m *Model) viewSwitchConfirm() string {
 		return ""
 	}
 
+	helpLines := m.renderHelpLines()
+	preview := m.switchConfirm.preview
+	currentName := "未知"
+	if preview != nil {
+		currentName = preview.CurrentProvider
+	}
+
 	restore := "关闭"
 	if m.switchConfirm.restoreSession {
 		restore = "开启"
@@ -754,18 +812,55 @@ func (m *Model) viewSwitchConfirm() string {
 		panelTitleStyle.Render("Switch Provider"),
 		"",
 		fmt.Sprintf("App: %s", m.switchConfirm.app.DisplayName()),
+		fmt.Sprintf("Current: %s", currentName),
 		fmt.Sprintf("Provider: %s", m.switchConfirm.provider.Name),
 		"",
 	}
 	body = append(body, providerURLLines(m.store, m.switchConfirm.app, m.switchConfirm.provider, max(24, min(m.width-8, 80)-6))...)
-	body = append(body,
-		"",
-		fmt.Sprintf("Codex 会话自动恢复: %s", restore),
-		"切换后会将旧 provider 的会话迁移到当前 provider。",
-	)
+
+	if preview != nil {
+		body = append(body, "", "Files:")
+		for _, file := range preview.Files {
+			if file.Changed() {
+				body = append(body, fmt.Sprintf("  %s (+%d -%d)", file.Path, file.Added, file.Removed))
+			} else {
+				body = append(body, fmt.Sprintf("  %s (no changes)", file.Path))
+			}
+		}
+
+		diffLines := preview.DiffLines()
+		body = append(body, "", "Diff:")
+		visibleLines := max(4, m.height-len(helpLines)-len(body)-8)
+		if m.switchConfirm.diffOffset > len(diffLines) {
+			m.switchConfirm.diffOffset = len(diffLines)
+		}
+		start := m.switchConfirm.diffOffset
+		end := start + visibleLines
+		if end > len(diffLines) {
+			end = len(diffLines)
+		}
+		if start > 0 {
+			body = append(body, mutedStyle.Render("... 上方还有 Diff ..."))
+		}
+		for _, line := range diffLines[start:end] {
+			body = append(body, renderDiffLine(line, max(24, min(m.width-8, 100)-6)))
+		}
+		if end < len(diffLines) {
+			body = append(body, mutedStyle.Render("... 下方还有 Diff ..."))
+		}
+	}
+
+	if m.switchConfirm.app == ccswitch.AppCodex {
+		body = append(body,
+			"",
+			fmt.Sprintf("Codex 会话自动恢复: %s", restore),
+			"切换后会将旧 provider 的会话迁移到当前 provider。",
+		)
+	} else {
+		body = append(body, "", "确认后才会写入 live 配置。")
+	}
 
 	panelLines := strings.Split(panelStyle.Width(max(50, min(m.width-8, 80))).Render(strings.Join(body, "\n")), "\n")
-	helpLines := m.renderHelpLines()
 	page := []string{m.renderHeader()}
 	topPadding := (m.height - len(panelLines) - len(helpLines) - 1) / 2
 	if topPadding < 1 {
@@ -943,12 +1038,11 @@ func (m *Model) renderHelpLines() []string {
 			}
 		}
 	case modeSwitchConfirm:
-		items = []string{
-			help("Enter/y", "切换并按当前选项恢复"),
-			help("r/Space", "开关会话恢复"),
-			help("n", "切换但不恢复"),
-			help("q/Esc", "返回"),
+		items = []string{help("Enter/y", "确认切换"), help("↑/↓ j/k", "滚动 Diff"), help("PgUp/PgDn", "翻页")}
+		if m.switchConfirm != nil && m.switchConfirm.app == ccswitch.AppCodex {
+			items = append(items, help("r/Space", "开关会话恢复"), help("n", "切换但不恢复"))
 		}
+		items = append(items, help("q/Esc", "返回"))
 	default:
 		items = []string{
 			help("↑/↓ j/k", "移动"),
@@ -994,6 +1088,10 @@ func newFormState(app ccswitch.AppType, provider *ccswitch.Provider, input ccswi
 		field.CharLimit = 2048
 		field.Width = 72
 		field.Placeholder = placeholderFor(app, label)
+		if label == "API Key" {
+			field.EchoMode = textinput.EchoPassword
+			field.EchoCharacter = '*'
+		}
 		fields = append(fields, field)
 	}
 
@@ -1130,18 +1228,11 @@ func (m *Model) providerCount(app ccswitch.AppType) int {
 }
 
 func (m *Model) formHint() string {
-	switch m.form.app {
-	case ccswitch.AppClaude:
-		return "Saved to ~/.claude/settings.json (or legacy claude.json)"
-	case ccswitch.AppCodex:
-		return "Saved to ~/.codex/auth.json and ~/.codex/config.toml"
-	case ccswitch.AppGemini:
-		return "Saved to ~/.gemini/.env and ~/.gemini/settings.json"
-	case ccswitch.AppOpencode:
-		return "Saved to ~/.config/opencode/opencode.json"
-	default:
-		return "Saved to the app live config"
+	paths := m.store.ConfigPaths(m.form.app)
+	if len(paths) > 0 {
+		return "Saved to " + strings.Join(paths, " and ")
 	}
+	return "Saved to the app live config"
 }
 
 func placeholderFor(app ccswitch.AppType, label string) string {

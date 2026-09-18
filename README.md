@@ -16,6 +16,7 @@
 - 使用 SQLite 保存供应商配置，数据默认位于 `~/.cc-switch/`
 - 首次启动时，如果某个应用还没有保存的供应商，会尝试导入当前 live 配置
 - 切换前会先读取当前 live 配置并回写数据库，尽量保留你在外部手动改过的内容
+- 切换前会检测 live 配置是否被外部修改；发现冲突时会取消切换，避免静默覆盖
 - 支持新增、编辑、删除、切换供应商
 - `Codex` 额外支持配置 `Reasoning Effort`
 - 切换 `Codex` 供应商时可选择自动恢复历史会话
@@ -30,7 +31,7 @@
 - `Codex`：`~/.codex/config.toml`
 - `Gemini`：`~/.gemini/.env`
 - `Gemini`：`~/.gemini/settings.json`
-- `Opencode`：`~/.config/opencode/opencode.json`
+- `Opencode`：`~/.config/opencode/opencode.json`（或 `opencode.jsonc`）
 
 程序自己的本地数据默认保存在：
 
@@ -97,7 +98,8 @@ go build -o cctui .
 
 启动后会看到按应用分组的供应商列表：
 
-- `Enter`：替换模式下将当前选中的供应商设为正在使用；增量模式下进入编辑
+- `Enter`：替换模式下先预览配置 Diff，确认后才切换；增量模式下进入编辑
+- 预览页面：`↑/↓` 或 `j/k` 滚动 Diff，`Enter` / `y` 确认切换，`q` / `Esc` 取消
 - 切换 `Codex` 时：`r` / `Space` 开关会话恢复，`Enter` / `y` 确认并按当前选项执行，`n` 仅切换不恢复
 - `a`：新增供应商
 - `e`：编辑供应商
@@ -139,9 +141,17 @@ go build -o cctui .
 
 切换到新供应商前，程序会先尝试读取当前 live 配置，并回写到当前供应商记录中；随后再把目标供应商写入 live 配置文件。
 
+切换前会显示将要写入的配置文件和 Diff。API Key、Token、密码等敏感值会脱敏显示；只有确认后才会执行切换。
+
 ### Codex 会话恢复
 
 切换 `Codex` 供应商时，TUI 默认打开会话恢复选项。确认后会读取 `~/.codex/state_5.sqlite`（或 `~/.codex/sqlite/state_5.sqlite`），将其他 provider 的未归档会话迁移到当前 provider，并同步修复 rollout JSONL 与 `session_index.jsonl`。修改前会自动创建带时间戳的 `.bak.session-restore-*` 备份；找不到 Codex 会话数据库时不会影响供应商切换，只会在状态栏提示恢复失败。
+
+恢复会话时会校验 rollout 路径位于 Codex 会话目录内，并校验 rollout 的线程 ID；保留原有归档和用户事件状态，session index 使用临时文件原子替换。
+
+### OpenCode 增量模式
+
+OpenCode 的每个 provider 按 `opencode.json` 中真实的 provider key 独立保存，不使用当前供应商状态。新增、编辑、删除 provider 时会保留其他 provider、额外模型及 provider-level 字段。
 
 ## 高级配置
 
@@ -157,6 +167,16 @@ go build -o cctui .
 ```
 
 其中“当前供应商”相关字段也会保存在这个文件里，通常不建议手动修改。
+
+如果对应 CLI 设置了原生配置路径环境变量，cctui 会优先跟随 CLI 的实际路径：
+
+- `Claude`：`CLAUDE_CONFIG_DIR`
+- `Codex`：`CODEX_HOME`
+- `Gemini`：`GEMINI_CLI_HOME`
+- `Opencode`：`OPENCODE_CONFIG`（完整配置文件）或 `OPENCODE_CONFIG_DIR`（配置目录）
+- Linux 下未设置 OpenCode 专用变量时，也会识别 `XDG_CONFIG_HOME/opencode`
+
+原生环境变量优先于 cctui 的目录覆盖设置，避免修改到 CLI 实际不会读取的文件。
 
 ## 适用场景
 
